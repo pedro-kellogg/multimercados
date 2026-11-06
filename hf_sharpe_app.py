@@ -1,5 +1,5 @@
 """
-Do Brazilian hedge funds (multimercados) from large managers improve a
+Does a given Brazilian hedge fund (or set of funds, by CNPJ) improve a
 diversified BRL portfolio's Sharpe ratio?
 
 Run:  pip install -r requirements.txt
@@ -221,15 +221,14 @@ def read_upload(file):
 # ----------------------------------------------------------------------------
 # Hedge-fund sleeve construction (point-in-time)
 # ----------------------------------------------------------------------------
-def build_sleeve(panel, reg, top_n, cnpj_list, weighting, max_abs_ret):
-    """Point-in-time HF sleeve.
+def build_sleeve(panel, reg, cnpj_list, weighting, max_abs_ret):
+    """Blend of the selected funds (equal or prior-month-AUM weighted).
 
-    Top-N mode: each January, rank managers by prior-December multimercado AUM
-    and hold one flagship per manager. CNPJ mode: hold the listed funds
-    whenever they report.
+    Returns the blended sleeve, a wide table of each fund's monthly returns,
+    and a per-fund info table.
     """
     df = panel.merge(reg, on="CNPJ_FUNDO", how="left")
-    df = df.sort_values(["CNPJ_FUNDO", "M"])
+    df = df[df["CNPJ_FUNDO"].isin(cnpj_list)].sort_values(["CNPJ_FUNDO", "M"])
     df["ret"] = df.groupby("CNPJ_FUNDO")["VL_QUOTA"].pct_change()
     df["pl_prev"] = df.groupby("CNPJ_FUNDO")["VL_PATRIM_LIQ"].shift()
     # Only accept consecutive months; drop data-error quota jumps
@@ -237,64 +236,40 @@ def build_sleeve(panel, reg, top_n, cnpj_list, weighting, max_abs_ret):
         lambda x: x.n if pd.notna(x) else np.nan)
     df.loc[gap != 1, "ret"] = np.nan
     df.loc[df["ret"].abs() > max_abs_ret, "ret"] = np.nan
-    df["year"] = df["M"].dt.year
-    years = sorted(df["year"].unique())
-    rows, picks = [], []
 
-    def add_month(m, g, w0=None):
-        g = g.dropna(subset=["ret"])  # dead funds drop out when they stop
-        if g.empty:
-            return
+    rows = []
+    for m, g in df.dropna(subset=["ret"]).groupby("M"):
         if weighting == "Equal":
             r_ = g["ret"].mean()
         else:
-            w = (w0.reindex(g["CNPJ_FUNDO"]).values if w0 is not None
-                 else g["pl_prev"].fillna(0).values)
-            r_ = np.average(g["ret"], weights=w) if np.nansum(w) > 0 \
-                else g["ret"].mean()
+            w = g["pl_prev"].fillna(0).values
+            r_ = np.average(g["ret"], weights=w) if w.sum() > 0 else g["ret"].mean()
         rows.append({"M": m, "HF": r_, "n_funds": len(g)})
-
-    if cnpj_list:
-        sel = df[df["CNPJ_FUNDO"].isin(cnpj_list)]
-        for m, g in sel.groupby("M"):
-            add_month(m, g)
-        for (y, c), g in sel.dropna(subset=["ret"]).groupby(["year", "CNPJ_FUNDO"]):
-            picks.append({"year": y, "manager": g["GESTOR"].iat[0],
-                          "fund": g["DENOM_SOCIAL"].iat[0], "cnpj": c,
-                          "aum_dec_bn": np.nan})
-    else:
-        for y in years[1:]:
-            # Selection uses December of y-1 only (no look-ahead)
-            dec = df[df["M"] == pd.Period(f"{y-1}-12", "M")]
-            if dec.empty:
-                continue
-            # Manager AUM: non-FIC funds (masters/standalones), no double count
-            aum = (dec[dec["FUNDO_COTAS"] != "S"]
-                   .groupby("CPF_CNPJ_GESTOR")["VL_PATRIM_LIQ"].sum()
-                   .sort_values(ascending=False))
-            names = dec.groupby("CPF_CNPJ_GESTOR")["GESTOR"].agg(
-                lambda s: s.mode().iat[0] if not s.mode().empty else "")
-            mgrs = list(aum.index[:top_n])
-            # Flagship: the manager's largest FIC (the feeder investors buy);
-            # if it has none, its largest fund
-            cand = dec[dec["CPF_CNPJ_GESTOR"].isin(mgrs)].copy()
-            cand["is_fic"] = cand["FUNDO_COTAS"] == "S"
-            flag = (cand.sort_values(["is_fic", "VL_PATRIM_LIQ"])
-                        .groupby("CPF_CNPJ_GESTOR").tail(1))
-            for _, r in flag.iterrows():
-                picks.append({"year": y,
-                              "manager": names.get(r.CPF_CNPJ_GESTOR, ""),
-                              "fund": r.DENOM_SOCIAL, "cnpj": r.CNPJ_FUNDO,
-                              "aum_dec_bn": aum.get(r.CPF_CNPJ_GESTOR, np.nan) / 1e9})
-            w0 = flag.set_index("CNPJ_FUNDO")["VL_PATRIM_LIQ"]
-            yr = df[(df["year"] == y) & df["CNPJ_FUNDO"].isin(set(flag["CNPJ_FUNDO"]))]
-            for m, g in yr.groupby("M"):
-                add_month(m, g, w0)
-
     sleeve = pd.DataFrame(rows).set_index("M").sort_index()
     sleeve.index = sleeve.index.to_timestamp(how="end").normalize()
-    last_seen = df.dropna(subset=["ret"]).groupby("CNPJ_FUNDO")["M"].max()
-    return sleeve, pd.DataFrame(picks), last_seen
+
+    # Readable, unique labels per fund
+    names = (df.groupby("CNPJ_FUNDO")["DENOM_SOCIAL"].first()
+               .fillna(pd.Series(df["CNPJ_FUNDO"].unique(),
+                                 index=df["CNPJ_FUNDO"].unique())))
+    labels = {}
+    for c, n in names.items():
+        lab = str(n)[:38].strip()
+        labels[c] = lab if lab not in labels.values() else f"{lab} ({c[:8]})"
+
+    wide = df.pivot(index="M", columns="CNPJ_FUNDO", values="ret")
+    wide.index = wide.index.to_timestamp(how="end").normalize()
+    wide = wide.rename(columns=labels)
+
+    ok = df.dropna(subset=["ret"])
+    info = ok.groupby("CNPJ_FUNDO").agg(
+        fund=("DENOM_SOCIAL", "first"), manager=("GESTOR", "first"),
+        first_month=("M", "min"), last_month=("M", "max"),
+        last_aum_mm=("VL_PATRIM_LIQ", "last"))
+    info["last_aum_mm"] /= 1e6
+    info["first_month"] = info["first_month"].astype(str)
+    info["last_month"] = info["last_month"].astype(str)
+    return sleeve, wide, info.reset_index().rename(columns={"CNPJ_FUNDO": "cnpj"})
 
 
 # ----------------------------------------------------------------------------
@@ -385,7 +360,7 @@ def _sig(p):
 
 def main():
     st.set_page_config("BR hedge funds vs Sharpe", layout="wide")
-    st.title("Do large-manager Brazilian hedge funds improve Sharpe?")
+    st.title("Does this fund improve my portfolio's Sharpe?")
 
     with st.sidebar:
         st.header("Period")
@@ -403,14 +378,14 @@ def main():
         st.caption(f"Window: **{start_m.strftime('%b %Y')} – "
                    f"{end_m.strftime('%b %Y')}**")
 
-        st.header("Hedge-fund universe")
-        top_n = st.slider("Top N managers by multimercado AUM", 5, 40, 15)
+        st.header("Funds")
         raw_cnpjs = st.text_area(
-            "…or fund CNPJs (one per line, overrides Top N)",
+            "Fund CNPJs (one per line)",
             placeholder="22.187.946/0001-41\n12.808.980/0001-32")
         cnpjs = [re.sub(r"\D", "", c).zfill(14)
                  for c in raw_cnpjs.splitlines() if re.sub(r"\D", "", c)]
-        weighting = st.radio("Sleeve weighting", ["Equal", "AUM"])
+        weighting = st.radio("Sleeve weighting (if several funds)",
+                             ["Equal", "AUM"])
         with st.expander("Advanced"):
             max_abs = st.number_input(
                 "Data-error filter: ignore fund monthly returns beyond ±",
@@ -446,6 +421,9 @@ def main():
                 "downloads several GB of CVM files and can take a while; "
                 "later runs use ./data_cache.")
         return
+    if not cnpjs:
+        st.error("Enter at least one fund CNPJ.")
+        return
     if (end_m - start_m).n < 24:
         st.error("Use a window of at least 24 months.")
         return
@@ -459,20 +437,11 @@ def main():
     # --- Registry & universe ------------------------------------------------
     with st.spinner("Loading CVM fund registry…"):
         reg = load_registry()
-    mm = reg[reg["CLASSE"].fillna("").str.contains("Multimercado", case=False)]
-    mm = mm[mm["FUNDO_EXCLUSIVO"] != "S"]
-    if cnpjs:
-        unknown = [c for c in cnpjs if c not in set(reg["CNPJ_FUNDO"])]
-        if unknown:
-            st.warning("Not in the CVM registry (names will be blank, data "
-                       f"still loaded if reported): {', '.join(unknown)}")
-        universe = frozenset(cnpjs)
-        meta = reg
-    else:
-        universe = frozenset(mm["CNPJ_FUNDO"])
-        meta = mm
-        st.write(f"Eligible multimercado funds in registry (incl. closed or "
-                 f"cancelled): **{len(mm):,}**")
+    unknown = [c for c in cnpjs if c not in set(reg["CNPJ_FUNDO"])]
+    if unknown:
+        st.warning("Not in the CVM registry (names will be blank, data "
+                   f"still loaded if reported): {', '.join(unknown)}")
+    universe = frozenset(cnpjs)
 
     prog = st.progress(0.0)
     panel = load_fund_panel((start_m - 1).year, end_m.to_timestamp(how="end"),
@@ -482,8 +451,8 @@ def main():
         st.error("No CVM data found for this universe.")
         return
 
-    sleeve, picks, last_seen = build_sleeve(panel, meta, top_n, cnpjs,
-                                            weighting, max_abs)
+    sleeve, fund_rets, info = build_sleeve(panel, reg, cnpjs, weighting,
+                                           max_abs)
 
     # --- Benchmarks ---------------------------------------------------------
     with st.spinner("Loading BCB / market data…"):
@@ -532,13 +501,46 @@ def main():
     ex = R.sub(rf, axis=0).drop(columns="CDI")
     risky = ["IMA-B", "Ibovespa", "World"]
 
-    tabs = st.tabs(["Summary", "Sharpe tests", "Spanning & factors",
-                    "Robustness", "Universe"])
+    tabs = st.tabs(["Performance", "Summary", "Sharpe tests",
+                    "Spanning & factors", "Robustness", "Funds"])
     fmt = {"Ann. return": "{:.2%}", "Ann. vol": "{:.2%}", "Sharpe": "{:.2f}",
            "Sortino": "{:.2f}", "Max DD": "{:.1%}", "Months": "{:.0f}"}
 
-    # --- Summary ------------------------------------------------------------
+    # --- Performance ----------------------------------------------------------
     with tabs[0]:
+        fr = fund_rets.loc[start_m.to_timestamp():end_m.to_timestamp(how="end")]
+        firsts = fr.apply(lambda c: c.first_valid_index())
+        firsts = firsts.dropna()
+        if firsts.empty:
+            st.warning("No fund returns in the selected window.")
+        else:
+            # Start where every fund has data (or the chosen start, if later)
+            t0 = firsts.max()
+            fr = fr.loc[t0:].dropna(axis=1, how="all")
+            ref = pd.concat({"CDI": cdi, "Ibovespa": ibov}, axis=1).reindex(fr.index)
+            lv = (1 + pd.concat([fr, ref], axis=1).fillna(0)).cumprod() * 100
+            base_row = pd.DataFrame(100.0, index=[t0 - pd.offsets.MonthEnd(1)],
+                                    columns=lv.columns)
+            lv = pd.concat([base_row, lv])
+            # Stop a fund's line (and CAGR) at its last reported month
+            lasts = fr.apply(lambda c: c.last_valid_index())
+            for c, t in lasts.items():
+                lv.loc[lv.index > t, c] = np.nan
+            n_m = pd.concat([fr.notna().sum(), pd.Series(len(fr), index=ref.columns)])
+            cagr = (lv.ffill().iloc[-1] / 100) ** (12 / n_m) - 1
+            fund_cagr = cagr[fr.columns].sort_values()
+            st.info(
+                f"Since **{base_row.index[0]:%b %Y}** ({len(fr)} months, the "
+                f"first month all selected funds have data), the best fund "
+                f"compounded **{_pct(fund_cagr.iloc[-1])}/yr** "
+                f"(*{fund_cagr.index[-1]}*) and the worst {_pct(fund_cagr.iloc[0])}/yr "
+                f"(*{fund_cagr.index[0]}*), vs CDI {_pct(cagr['CDI'])}/yr and "
+                f"Ibovespa {_pct(cagr['Ibovespa'])}/yr.")
+            st.subheader("Cumulative return (rebased to 100)")
+            st.line_chart(lv)
+
+    # --- Summary ------------------------------------------------------------
+    with tabs[1]:
         stats = pd.DataFrame({k: ann_stats(P[k], rf) for k in P}).T
         assets = pd.DataFrame({k: ann_stats(R[k], rf)
                                for k in ["CDI", "IMA-B", "Ibovespa", "World", "HF"]}).T
@@ -559,7 +561,7 @@ def main():
         st.line_chart((1 + P.sub(rf, axis=0)).cumprod())
 
     # --- Sharpe tests -------------------------------------------------------
-    with tabs[1]:
+    with tabs[2]:
         rows = []
         base_ex = (P["Baseline"] - rf).values
         for k in P.columns[1:]:
@@ -580,7 +582,7 @@ def main():
                                      "SE (ann.)": "{:.3f}", "p-value": "{:.3f}"}))
 
     # --- Spanning / factors ---------------------------------------------------
-    with tabs[2]:
+    with tabs[3]:
         m1 = hac_ols(ex["HF"], ex[risky])
         a, se_eps = m1.params["const"], np.sqrt(m1.scale)
         sr_base = tangency_sharpe(ex[risky])
@@ -622,7 +624,7 @@ def main():
         st.caption(f"R² = {m2.rsquared:.2f}, N = {int(m2.nobs)}")
 
     # --- Robustness -----------------------------------------------------------
-    with tabs[3]:
+    with tabs[4]:
         cuts = [("2010-01", "2014-12"), ("2015-01", "2019-12"),
                 ("2020-01", "2022-12"), ("2023-01", "2099-12")]
         sub = []
@@ -678,24 +680,23 @@ def main():
             "Avg return, other months": R[~worst][["Ibovespa", "HF"]].mean(),
         }).style.format("{:.2%}"))
 
-    # --- Universe -------------------------------------------------------------
-    with tabs[4]:
-        held = picks["cnpj"].unique() if len(picks) else []
-        dead = [c for c in held if last_seen.get(c, end_m) < end_m]
+    # --- Funds --------------------------------------------------------------
+    with tabs[5]:
+        dead = info[info["last_month"] < str(end_m)]
         st.info(
-            f"The sleeve held **{sleeve['n_funds'].mean():.1f} funds** on average "
-            f"over {len(R)} months, using {len(held)} distinct funds. "
-            f"**{len(dead)}** of them stopped reporting before the end of the "
-            f"sample (closed, merged or migrated) and are kept until their last "
-            f"month, so results aren't flattered by survivorship.")
-        st.subheader("Funds held each year")
-        st.dataframe(picks, width="stretch")
+            f"**{len(info)}** fund(s) with data. "
+            + (f"{len(dead)} stopped reporting before {end_m.strftime('%b %Y')} "
+               "(closed, merged or migrated) and are kept until their last month."
+               if len(dead) else "All report through the end of the sample.")
+            + f" The blended sleeve holds {sleeve['n_funds'].loc[R.index].mean():.1f} "
+              "funds on average.")
+        st.dataframe(info.style.format({"last_aum_mm": "R$ {:,.0f} mm"}),
+                     width="stretch")
         st.subheader("Number of live funds in sleeve")
         st.line_chart(sleeve["n_funds"])
         st.download_button("Download monthly returns (CSV)",
-                           pd.concat([R, P], axis=1).to_csv(),
+                           pd.concat([R, P, fund_rets], axis=1).to_csv(),
                            "monthly_returns.csv")
-
 
 if __name__ == "__main__":
     main()
