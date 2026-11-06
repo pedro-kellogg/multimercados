@@ -221,68 +221,80 @@ def read_upload(file):
 # ----------------------------------------------------------------------------
 # Hedge-fund sleeve construction (point-in-time)
 # ----------------------------------------------------------------------------
-def build_sleeve(panel, reg, top_n, min_cotst, manual_managers,
-                 weighting, max_abs_ret):
+def build_sleeve(panel, reg, top_n, cnpj_list, weighting, max_abs_ret):
+    """Point-in-time HF sleeve.
+
+    Top-N mode: each January, rank managers by prior-December multimercado AUM
+    and hold one flagship per manager. CNPJ mode: hold the listed funds
+    whenever they report.
+    """
     df = panel.merge(reg, on="CNPJ_FUNDO", how="left")
     df = df.sort_values(["CNPJ_FUNDO", "M"])
     df["ret"] = df.groupby("CNPJ_FUNDO")["VL_QUOTA"].pct_change()
-    # Only accept consecutive months; flag absurd quota jumps
+    df["pl_prev"] = df.groupby("CNPJ_FUNDO")["VL_PATRIM_LIQ"].shift()
+    # Only accept consecutive months; drop data-error quota jumps
     gap = df.groupby("CNPJ_FUNDO")["M"].diff().apply(
         lambda x: x.n if pd.notna(x) else np.nan)
     df.loc[gap != 1, "ret"] = np.nan
     df.loc[df["ret"].abs() > max_abs_ret, "ret"] = np.nan
-
     df["year"] = df["M"].dt.year
-    months = sorted(df["M"].unique())
-    years = sorted({m.year for m in months})
+    years = sorted(df["year"].unique())
     rows, picks = [], []
 
-    for y in years[1:]:
-        # Selection uses December of y-1 only (no look-ahead)
-        dec = df[df["M"] == pd.Period(f"{y-1}-12", "M")]
-        if dec.empty:
-            continue
-        # Manager AUM: non-FIC funds (masters/standalones) to avoid double count
-        aum = (dec[dec["FUNDO_COTAS"] != "S"]
-               .groupby("CPF_CNPJ_GESTOR")["VL_PATRIM_LIQ"].sum()
-               .sort_values(ascending=False))
-        names = dec.groupby("CPF_CNPJ_GESTOR")["GESTOR"].agg(
-            lambda s: s.mode().iat[0] if not s.mode().empty else "")
-        if manual_managers:
-            pat = "|".join(re.escape(m) for m in manual_managers)
-            mgrs = [g for g in aum.index
-                    if re.search(pat, str(names.get(g, "")), re.I)]
+    def add_month(m, g, w0=None):
+        g = g.dropna(subset=["ret"])  # dead funds drop out when they stop
+        if g.empty:
+            return
+        if weighting == "Equal":
+            r_ = g["ret"].mean()
         else:
-            mgrs = list(aum.index[:top_n])
+            w = (w0.reindex(g["CNPJ_FUNDO"]).values if w0 is not None
+                 else g["pl_prev"].fillna(0).values)
+            r_ = np.average(g["ret"], weights=w) if np.nansum(w) > 0 \
+                else g["ret"].mean()
+        rows.append({"M": m, "HF": r_, "n_funds": len(g)})
 
-        # Flagship per manager: largest investable fund (many quotaholders,
-        # which naturally picks the feeder investors actually buy)
-        inv = dec[(dec["NR_COTST"] >= min_cotst)
-                  & dec["CPF_CNPJ_GESTOR"].isin(mgrs)]
-        flag = (inv.sort_values("VL_PATRIM_LIQ")
-                   .groupby("CPF_CNPJ_GESTOR").tail(1))
-        for _, r in flag.iterrows():
-            picks.append({"year": y, "manager": names.get(r.CPF_CNPJ_GESTOR, ""),
-                          "fund": r.DENOM_SOCIAL, "cnpj": r.CNPJ_FUNDO,
-                          "aum_dec_bn": aum.get(r.CPF_CNPJ_GESTOR, np.nan) / 1e9})
-        sel = set(flag["CNPJ_FUNDO"])
-        w0 = flag.set_index("CNPJ_FUNDO")["VL_PATRIM_LIQ"]
-
-        yr = df[(df["year"] == y) & df["CNPJ_FUNDO"].isin(sel)]
-        for m, g in yr.groupby("M"):
-            g = g.dropna(subset=["ret"])  # dead funds drop out when they stop
-            if g.empty:
+    if cnpj_list:
+        sel = df[df["CNPJ_FUNDO"].isin(cnpj_list)]
+        for m, g in sel.groupby("M"):
+            add_month(m, g)
+        for (y, c), g in sel.dropna(subset=["ret"]).groupby(["year", "CNPJ_FUNDO"]):
+            picks.append({"year": y, "manager": g["GESTOR"].iat[0],
+                          "fund": g["DENOM_SOCIAL"].iat[0], "cnpj": c,
+                          "aum_dec_bn": np.nan})
+    else:
+        for y in years[1:]:
+            # Selection uses December of y-1 only (no look-ahead)
+            dec = df[df["M"] == pd.Period(f"{y-1}-12", "M")]
+            if dec.empty:
                 continue
-            if weighting == "Equal":
-                r_ = g["ret"].mean()
-            else:
-                w = w0.reindex(g["CNPJ_FUNDO"]).values
-                r_ = np.average(g["ret"], weights=w)
-            rows.append({"M": m, "HF": r_, "n_funds": len(g)})
+            # Manager AUM: non-FIC funds (masters/standalones), no double count
+            aum = (dec[dec["FUNDO_COTAS"] != "S"]
+                   .groupby("CPF_CNPJ_GESTOR")["VL_PATRIM_LIQ"].sum()
+                   .sort_values(ascending=False))
+            names = dec.groupby("CPF_CNPJ_GESTOR")["GESTOR"].agg(
+                lambda s: s.mode().iat[0] if not s.mode().empty else "")
+            mgrs = list(aum.index[:top_n])
+            # Flagship: the manager's largest FIC (the feeder investors buy);
+            # if it has none, its largest fund
+            cand = dec[dec["CPF_CNPJ_GESTOR"].isin(mgrs)].copy()
+            cand["is_fic"] = cand["FUNDO_COTAS"] == "S"
+            flag = (cand.sort_values(["is_fic", "VL_PATRIM_LIQ"])
+                        .groupby("CPF_CNPJ_GESTOR").tail(1))
+            for _, r in flag.iterrows():
+                picks.append({"year": y,
+                              "manager": names.get(r.CPF_CNPJ_GESTOR, ""),
+                              "fund": r.DENOM_SOCIAL, "cnpj": r.CNPJ_FUNDO,
+                              "aum_dec_bn": aum.get(r.CPF_CNPJ_GESTOR, np.nan) / 1e9})
+            w0 = flag.set_index("CNPJ_FUNDO")["VL_PATRIM_LIQ"]
+            yr = df[(df["year"] == y) & df["CNPJ_FUNDO"].isin(set(flag["CNPJ_FUNDO"]))]
+            for m, g in yr.groupby("M"):
+                add_month(m, g, w0)
 
     sleeve = pd.DataFrame(rows).set_index("M").sort_index()
     sleeve.index = sleeve.index.to_timestamp(how="end").normalize()
-    return sleeve, pd.DataFrame(picks)
+    last_seen = df.dropna(subset=["ret"]).groupby("CNPJ_FUNDO")["M"].max()
+    return sleeve, pd.DataFrame(picks), last_seen
 
 
 # ----------------------------------------------------------------------------
@@ -362,28 +374,51 @@ def portfolio(rets, w):
 # ----------------------------------------------------------------------------
 # App
 # ----------------------------------------------------------------------------
+def _pct(x):
+    return f"{x:.1%}"
+
+
+def _sig(p):
+    return "significant at 5%" if p < 0.05 else (
+        "significant at 10%" if p < 0.10 else "not statistically significant")
+
+
 def main():
     st.set_page_config("BR hedge funds vs Sharpe", layout="wide")
     st.title("Do large-manager Brazilian hedge funds improve Sharpe?")
 
     with st.sidebar:
         st.header("Period")
-        start_year = st.number_input("Start year", 2005, 2025, 2010)
-        end_date = st.date_input("End date", date.today())
+        st.caption("Pick any day; the analysis uses whole months.")
+        d0 = st.date_input("Start (year-month)", date(2010, 1, 1),
+                           min_value=date(2005, 1, 1), max_value=date.today(),
+                           format="YYYY/MM/DD")
+        d1 = st.date_input("End (year-month)", date.today(),
+                           min_value=date(2005, 1, 1), max_value=date.today(),
+                           format="YYYY/MM/DD")
+        start_m = pd.Period(d0, "M")
+        end_m = pd.Period(d1, "M")
+        if pd.Timestamp(d1) < end_m.to_timestamp(how="end").normalize():
+            end_m -= 1  # drop an incomplete final month
+        st.caption(f"Window: **{start_m.strftime('%b %Y')} – "
+                   f"{end_m.strftime('%b %Y')}**")
 
         st.header("Hedge-fund universe")
         top_n = st.slider("Top N managers by multimercado AUM", 5, 40, 15)
-        manual = st.text_area(
-            "…or manager names (one per line, overrides Top N)",
-            placeholder="VERDE\nSPX\nKAPITALO\nLEGACY\nIBIUNA")
-        manual = [m.strip() for m in manual.splitlines() if m.strip()]
-        min_cotst = st.number_input("Min. quotaholders (investable fund)", 1,
-                                    100000, 100)
-        excl_prev = st.checkbox("Exclude previdência (name contains PREV)", True)
-        excl_qual = st.checkbox("Exclude qualified-investor-only funds", False)
+        raw_cnpjs = st.text_area(
+            "…or fund CNPJs (one per line, overrides Top N)",
+            placeholder="22.187.946/0001-41\n12.808.980/0001-32")
+        cnpjs = [re.sub(r"\D", "", c).zfill(14)
+                 for c in raw_cnpjs.splitlines() if re.sub(r"\D", "", c)]
         weighting = st.radio("Sleeve weighting", ["Equal", "AUM"])
-        max_abs = st.number_input("Drop monthly returns above (abs)", 0.1,
-                                  5.0, 0.5)
+        with st.expander("Advanced"):
+            max_abs = st.number_input(
+                "Data-error filter: ignore fund monthly returns beyond ±",
+                0.1, 5.0, 0.5, step=0.1,
+                help="CVM quota series sometimes contain errors (wrong decimal, "
+                     "quota splits/consolidations). A month where a fund's "
+                     "quota moves more than this (0.5 = ±50%) is treated as "
+                     "bad data and excluded for that fund.")
 
         st.header("Baseline portfolio (weights)")
         w_cdi = st.number_input("CDI", 0.0, 1.0, 0.40)
@@ -403,7 +438,6 @@ def main():
                    "values > 2 are treated as index levels.")
         up = {k: st.file_uploader(k, type="csv", key=k)
               for k in ["IMA-B", "Ibovespa", "World (BRL)"]}
-        use_nefin = st.checkbox("Add NEFIN factors to factor regression", True)
 
         run = st.button("Run analysis", type="primary")
 
@@ -412,29 +446,44 @@ def main():
                 "downloads several GB of CVM files and can take a while; "
                 "later runs use ./data_cache.")
         return
+    if (end_m - start_m).n < 24:
+        st.error("Use a window of at least 24 months.")
+        return
+    if not sleeves:
+        st.error("Pick at least one HF sleeve size.")
+        return
 
-    start = f"{start_year - 1}-12-01"
-    end = str(end_date)
+    start = (start_m - 1).to_timestamp().strftime("%Y-%m-%d")
+    end = end_m.to_timestamp(how="end").strftime("%Y-%m-%d")
 
     # --- Registry & universe ------------------------------------------------
     with st.spinner("Loading CVM fund registry…"):
         reg = load_registry()
     mm = reg[reg["CLASSE"].fillna("").str.contains("Multimercado", case=False)]
     mm = mm[mm["FUNDO_EXCLUSIVO"] != "S"]
-    if excl_prev:
-        mm = mm[~mm["DENOM_SOCIAL"].fillna("").str.contains("PREV", case=False)]
-    if excl_qual and "INVEST_QUALIF" in mm:
-        mm = mm[mm["INVEST_QUALIF"] != "S"]
-    st.write(f"Multimercado funds in registry (incl. closed/cancelled): "
-             f"**{len(mm):,}**")
+    if cnpjs:
+        unknown = [c for c in cnpjs if c not in set(reg["CNPJ_FUNDO"])]
+        if unknown:
+            st.warning("Not in the CVM registry (names will be blank, data "
+                       f"still loaded if reported): {', '.join(unknown)}")
+        universe = frozenset(cnpjs)
+        meta = reg
+    else:
+        universe = frozenset(mm["CNPJ_FUNDO"])
+        meta = mm
+        st.write(f"Eligible multimercado funds in registry (incl. closed or "
+                 f"cancelled): **{len(mm):,}**")
 
     prog = st.progress(0.0)
-    panel = load_fund_panel(start_year - 1, pd.Timestamp(end_date),
-                            frozenset(mm["CNPJ_FUNDO"]), prog)
+    panel = load_fund_panel((start_m - 1).year, end_m.to_timestamp(how="end"),
+                            universe, prog)
     prog.empty()
+    if panel.empty:
+        st.error("No CVM data found for this universe.")
+        return
 
-    sleeve, picks = build_sleeve(panel, mm, top_n, min_cotst, manual,
-                                 weighting, max_abs)
+    sleeve, picks, last_seen = build_sleeve(panel, meta, top_n, cnpjs,
+                                            weighting, max_abs)
 
     # --- Benchmarks ---------------------------------------------------------
     with st.spinner("Loading BCB / market data…"):
@@ -463,7 +512,10 @@ def main():
 
     R = pd.concat({"CDI": cdi, "IMA-B": imab, "Ibovespa": ibov,
                    "World": world, "HF": sleeve["HF"]}, axis=1)
-    R = R.loc[f"{start_year}-01-01":].dropna()
+    R = R.loc[start_m.to_timestamp():end_m.to_timestamp(how="end")].dropna()
+    if len(R) < 24:
+        st.error(f"Only {len(R)} months with data for every series.")
+        return
     rf = R["CDI"]
     st.caption(f"Sample: {R.index[0]:%b %Y} – {R.index[-1]:%b %Y} "
                f"({len(R)} months)")
@@ -471,28 +523,38 @@ def main():
     base_w = {"CDI": w_cdi, "IMA-B": w_imab, "Ibovespa": w_ibov,
               "World": w_world}
     ports = {"Baseline": portfolio(R, base_w)}
-    for s in sleeves:
+    for s in sorted(sleeves):
         w = {k: v * (1 - s) for k, v in base_w.items()}
         w["HF"] = s
         ports[f"Baseline + {int(s*100)}% HF"] = portfolio(R, w)
     P = pd.DataFrame(ports)
+    last = P.columns[-1]
+    ex = R.sub(rf, axis=0).drop(columns="CDI")
+    risky = ["IMA-B", "Ibovespa", "World"]
 
     tabs = st.tabs(["Summary", "Sharpe tests", "Spanning & factors",
                     "Robustness", "Universe"])
+    fmt = {"Ann. return": "{:.2%}", "Ann. vol": "{:.2%}", "Sharpe": "{:.2f}",
+           "Sortino": "{:.2f}", "Max DD": "{:.1%}", "Months": "{:.0f}"}
 
     # --- Summary ------------------------------------------------------------
     with tabs[0]:
         stats = pd.DataFrame({k: ann_stats(P[k], rf) for k in P}).T
         assets = pd.DataFrame({k: ann_stats(R[k], rf)
-                               for k in ["IMA-B", "Ibovespa", "World", "HF"]}).T
+                               for k in ["CDI", "IMA-B", "Ibovespa", "World", "HF"]}).T
+        best = stats["Sharpe"].idxmax()
+        st.info(
+            f"Baseline Sharpe is **{stats.loc['Baseline','Sharpe']:.2f}**; with "
+            f"the largest sleeve ({last}) it is **{stats.loc[last,'Sharpe']:.2f}**, "
+            f"and the best of all mixes is *{best}*. "
+            f"The HF sleeve alone returned {_pct(assets.loc['HF','Ann. return'])}/yr "
+            f"vs CDI {_pct(assets.loc['CDI','Ann. return'])}, with max drawdown "
+            f"{_pct(assets.loc['HF','Max DD'])} (baseline: "
+            f"{_pct(stats.loc['Baseline','Max DD'])}).")
         st.subheader("Portfolios")
-        st.dataframe(stats.style.format({
-            "Ann. return": "{:.2%}", "Ann. vol": "{:.2%}", "Sharpe": "{:.2f}",
-            "Sortino": "{:.2f}", "Max DD": "{:.1%}", "Months": "{:.0f}"}))
+        st.dataframe(stats.style.format(fmt))
         st.subheader("Building blocks")
-        st.dataframe(assets.style.format({
-            "Ann. return": "{:.2%}", "Ann. vol": "{:.2%}", "Sharpe": "{:.2f}",
-            "Sortino": "{:.2f}", "Max DD": "{:.1%}", "Months": "{:.0f}"}))
+        st.dataframe(assets.style.format(fmt))
         st.subheader("Cumulative excess return over CDI")
         st.line_chart((1 + P.sub(rf, axis=0)).cumprod())
 
@@ -504,91 +566,113 @@ def main():
             d, se, p = sharpe_diff_test((P[k] - rf).values, base_ex)
             rows.append({"Portfolio": k, "ΔSharpe (ann.)": d * np.sqrt(12),
                          "SE (ann.)": se * np.sqrt(12), "p-value": p})
+        T = pd.DataFrame(rows).set_index("Portfolio")
+        kb = T["ΔSharpe (ann.)"].abs().idxmax()
+        st.info(
+            f"The biggest change is **{T.loc[kb,'ΔSharpe (ann.)']:+.2f}** "
+            f"Sharpe points for *{kb}* (p = {T.loc[kb,'p-value']:.3f}), which is "
+            f"**{_sig(T.loc[kb,'p-value'])}**. "
+            + ("Adding hedge funds measurably changed risk-adjusted return."
+               if T["p-value"].min() < 0.05 else
+               "The data can't distinguish the HF portfolios from the baseline."))
         st.markdown("Ledoit-Wolf (2008) HAC test, H0: Sharpe equal to baseline.")
-        st.dataframe(pd.DataFrame(rows).set_index("Portfolio").style.format(
-            {"ΔSharpe (ann.)": "{:+.3f}", "SE (ann.)": "{:.3f}",
-             "p-value": "{:.3f}"}))
+        st.dataframe(T.style.format({"ΔSharpe (ann.)": "{:+.3f}",
+                                     "SE (ann.)": "{:.3f}", "p-value": "{:.3f}"}))
 
     # --- Spanning / factors ---------------------------------------------------
     with tabs[2]:
-        ex = R.sub(rf, axis=0).drop(columns="CDI")
-        risky = ["IMA-B", "Ibovespa", "World"]
         m1 = hac_ols(ex["HF"], ex[risky])
         a, se_eps = m1.params["const"], np.sqrt(m1.scale)
         sr_base = tangency_sharpe(ex[risky])
         ar = a / se_eps * np.sqrt(12)
+        sr_new = np.sqrt(sr_base**2 + ar**2) if a > 0 else sr_base
+
+        F = ex[risky].copy()
+        F["USD/BRL"] = fx.reindex(F.index)
+        nf = nefin_factors()
+        if not nf.empty:
+            F = F.join(nf.drop(columns="Market", errors="ignore"), how="left")
+        F = F.dropna(axis=1, how="all")
+        m2 = hac_ols(ex["HF"], F)
+        a2, t2 = m2.params["const"] * 12, m2.tvalues["const"]
+
+        st.info(
+            f"Against the baseline assets, HF alpha is **{_pct(a*12)}/yr** "
+            f"(t = {m1.tvalues['const']:.2f}); in-sample it would lift the best "
+            f"achievable Sharpe from {sr_base:.2f} to {sr_new:.2f}. "
+            f"Adding FX{' and NEFIN' if not nf.empty else ''} factors, alpha is "
+            f"{_pct(a2)}/yr (t = {t2:.2f}), so it "
+            + ("**survives** the factor controls." if abs(t2) >= 2 and a2 > 0 else
+               "is **not robust** to factor controls (much of it looks like "
+               "replicable exposure or noise)."))
         st.subheader("Spanning regression: HF excess on baseline assets")
         st.text(m1.summary().tables[1].as_text())
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Alpha (ann.)", f"{a*12:.2%}",
-                  f"t = {m1.tvalues['const']:.2f}", delta_color="off")
+        c1.metric("Alpha (ann.)", _pct(a * 12))
         c2.metric("Appraisal ratio (ann.)", f"{ar:.2f}")
-        c3.metric("Tangency Sharpe, base assets", f"{sr_base:.2f}")
-        c4.metric("Tangency Sharpe, + HF", f"{np.sqrt(sr_base**2 + ar**2):.2f}")
+        c3.metric("Tangency Sharpe, base", f"{sr_base:.2f}")
+        c4.metric("Tangency Sharpe, + HF", f"{sr_new:.2f}")
         st.caption("Positive, significant alpha ⇒ HF expands the efficient "
                    "frontier: SR²(new) = SR²(old) + (α/σε)². In-sample "
-                   "tangency Sharpes are upper bounds, not achievable figures.")
-
+                   "tangency Sharpes are upper bounds.")
         st.subheader("Factor regression (is the alpha cheap beta?)")
-        F = ex[risky].copy()
-        F["USD/BRL"] = fx.reindex(F.index)
-        if use_nefin:
-            nf = nefin_factors()
-            if nf.empty:
-                st.warning("NEFIN factors unavailable; skipped.")
-            else:
-                nf = nf.drop(columns="Market", errors="ignore")
-                F = F.join(nf, how="left")
-        F = F.dropna(axis=1, how="all")
-        m2 = hac_ols(ex["HF"], F)
+        if nf.empty:
+            st.warning("NEFIN factors unavailable; using baseline assets + FX.")
         st.text(m2.summary().tables[1].as_text())
-        st.caption(f"R² = {m2.rsquared:.2f}, N = {int(m2.nobs)}. "
-                   f"Alpha (ann.) = {m2.params['const']*12:.2%}, "
-                   f"t = {m2.tvalues['const']:.2f}")
+        st.caption(f"R² = {m2.rsquared:.2f}, N = {int(m2.nobs)}")
 
     # --- Robustness -----------------------------------------------------------
     with tabs[3]:
-        st.subheader("Sub-periods")
         cuts = [("2010-01", "2014-12"), ("2015-01", "2019-12"),
-                ("2020-01", "2022-12"), ("2023-01", str(end_date)[:7])]
+                ("2020-01", "2022-12"), ("2023-01", "2099-12")]
         sub = []
         for s0, s1 in cuts:
             Ps, rfs = P.loc[s0:s1], rf.loc[s0:s1]
             if len(Ps) < 24:
                 continue
-            row = {"Period": f"{s0[:4]}–{s1[:4]}"}
+            row = {"Period": f"{Ps.index[0]:%Y}–{Ps.index[-1]:%Y}"}
             for k in P:
                 e = Ps[k] - rfs
                 row[k] = e.mean() / e.std() * np.sqrt(12)
-            k_last = P.columns[-1]
-            _, _, p = sharpe_diff_test((Ps[k_last] - rfs).values,
+            _, _, p = sharpe_diff_test((Ps[last] - rfs).values,
                                        (Ps["Baseline"] - rfs).values)
-            row[f"p ({k_last} vs base)"] = p
-            mm_ = hac_ols((R["HF"] - rf).loc[s0:s1],
-                          ex[risky].loc[s0:s1])
+            row[f"p ({last} vs base)"] = p
+            mm_ = hac_ols(ex["HF"].loc[s0:s1], ex[risky].loc[s0:s1])
             row["HF alpha ann."] = mm_.params["const"] * 12
             row["alpha t"] = mm_.tvalues["const"]
             sub.append(row)
-        st.dataframe(pd.DataFrame(sub).set_index("Period").style.format("{:.2f}"))
+        S = pd.DataFrame(sub).set_index("Period") if sub else pd.DataFrame()
 
-        st.subheader("Rolling 36-month Sharpe")
-        roll = P.sub(rf, axis=0).rolling(36)
-        st.line_chart(roll.mean() / roll.std() * np.sqrt(12))
-
-        st.subheader("Rolling 36-month HF alpha (ann.)")
         alphas = {}
         for i in range(36, len(ex) + 1):
             w_ = ex.iloc[i - 36:i]
-            X = sm.add_constant(w_[risky])
-            alphas[w_.index[-1]] = sm.OLS(w_["HF"], X).fit().params["const"] * 12
-        st.line_chart(pd.Series(alphas, name="alpha"))
+            alphas[w_.index[-1]] = sm.OLS(
+                w_["HF"], sm.add_constant(w_[risky])).fit().params["const"] * 12
+        alphas = pd.Series(alphas, name="alpha")
+        worst = R["Ibovespa"] <= R["Ibovespa"].quantile(0.1)
 
+        n_pos = int(((S["HF alpha ann."] > 0) & (S["alpha t"] >= 2)).sum()) if len(S) else 0
+        st.info(
+            f"HF alpha was positive and significant (t ≥ 2) in **{n_pos} of "
+            f"{len(S)}** sub-periods"
+            + (f"; the latest 36-month alpha is {_pct(alphas.iloc[-1])}/yr."
+               if len(alphas) else ".")
+            + f" In Ibovespa's worst 10% of months the sleeve averaged "
+            f"{_pct(R.loc[worst,'HF'].mean())} vs Ibovespa "
+            f"{_pct(R.loc[worst,'Ibovespa'].mean())}, a measure of crisis "
+            f"diversification.")
+        if len(S):
+            st.subheader("Sub-periods")
+            st.dataframe(S.style.format("{:.2f}"))
+        st.subheader("Rolling 36-month Sharpe")
+        roll = P.sub(rf, axis=0).rolling(36)
+        st.line_chart(roll.mean() / roll.std() * np.sqrt(12))
+        st.subheader("Rolling 36-month HF alpha (ann.)")
+        st.line_chart(alphas)
         st.subheader("Drawdowns")
         wealth = (1 + P).cumprod()
         st.area_chart(wealth / wealth.cummax() - 1)
-
-        st.subheader("HF correlation with Ibovespa in its worst months")
-        worst = R["Ibovespa"] <= R["Ibovespa"].quantile(0.1)
+        st.subheader("Returns in Ibovespa's worst months")
         st.write(pd.DataFrame({
             "Avg return, worst 10% Ibov months": R[worst][["Ibovespa", "HF"]].mean(),
             "Avg return, other months": R[~worst][["Ibovespa", "HF"]].mean(),
@@ -596,8 +680,16 @@ def main():
 
     # --- Universe -------------------------------------------------------------
     with tabs[4]:
-        st.subheader("Funds held each year (selected in prior December)")
-        st.dataframe(picks, use_container_width=True)
+        held = picks["cnpj"].unique() if len(picks) else []
+        dead = [c for c in held if last_seen.get(c, end_m) < end_m]
+        st.info(
+            f"The sleeve held **{sleeve['n_funds'].mean():.1f} funds** on average "
+            f"over {len(R)} months, using {len(held)} distinct funds. "
+            f"**{len(dead)}** of them stopped reporting before the end of the "
+            f"sample (closed, merged or migrated) and are kept until their last "
+            f"month, so results aren't flattered by survivorship.")
+        st.subheader("Funds held each year")
+        st.dataframe(picks, width="stretch")
         st.subheader("Number of live funds in sleeve")
         st.line_chart(sleeve["n_funds"])
         st.download_button("Download monthly returns (CSV)",
