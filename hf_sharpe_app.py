@@ -298,26 +298,47 @@ def load_fund_panel(start_year, end_date, cnpjs, progress=None, workers=6):
 # ----------------------------------------------------------------------------
 # BCB / Yahoo / NEFIN
 # ----------------------------------------------------------------------------
+def _sgs_chunk(code, s, e, tries=4):
+    """One SGS request with retries. BCB sometimes answers with an empty or
+    HTML page (throttling/maintenance) instead of JSON, so retry with backoff."""
+    params = {"formato": "json", "dataInicial": s.strftime("%d/%m/%Y"),
+              "dataFinal": e.strftime("%d/%m/%Y")}
+    last = None
+    for k in range(tries):
+        try:
+            r = requests.get(BCB_SGS.format(code=code), params=params,
+                             headers={**HEADERS, "Accept": "application/json"},
+                             timeout=60)
+            if r.status_code == 404:  # no observations in this range
+                return pd.DataFrame()
+            r.raise_for_status()
+            return pd.DataFrame(r.json())
+        except (ValueError, requests.RequestException) as ex:
+            last = ex
+            time.sleep(2 * (k + 1))
+    raise RuntimeError(f"BCB SGS series {code} ({s:%d/%m/%Y}–{e:%d/%m/%Y}) "
+                       f"did not return data after {tries} tries: "
+                       f"{type(last).__name__}")
+
+
 @st.cache_data(show_spinner=False)
 def sgs(code, start, end):
-    """SGS series, fetched in <=10y chunks (API limit for daily series)."""
+    """SGS series, fetched in 5-year chunks (API limit is 10y for daily)."""
     frames = []
     s = pd.Timestamp(start)
-    end = pd.Timestamp(end)
+    end = min(pd.Timestamp(end), pd.Timestamp(date.today()))
     while s <= end:
-        e = min(s + pd.DateOffset(years=10) - pd.Timedelta(days=1), end)
-        params = {"formato": "json",
-                  "dataInicial": s.strftime("%d/%m/%Y"),
-                  "dataFinal": e.strftime("%d/%m/%Y")}
-        r = requests.get(BCB_SGS.format(code=code), params=params,
-                         headers=HEADERS, timeout=120)
-        r.raise_for_status()
-        frames.append(pd.DataFrame(r.json()))
+        e = min(s + pd.DateOffset(years=5) - pd.Timedelta(days=1), end)
+        frames.append(_sgs_chunk(code, s, e))
         s = e + pd.Timedelta(days=1)
+        time.sleep(0.3)  # be gentle; BCB throttles bursts
     df = pd.concat(frames)
+    if df.empty:
+        raise RuntimeError(f"BCB SGS series {code} returned no data.")
     df["data"] = pd.to_datetime(df["data"], dayfirst=True)
     df["valor"] = pd.to_numeric(df["valor"], errors="coerce")
-    return df.set_index("data")["valor"].sort_index()
+    out = df.set_index("data")["valor"].sort_index()
+    return out[~out.index.duplicated(keep="last")]
 
 
 @st.cache_data(show_spinner=False)
@@ -707,7 +728,12 @@ def main():
 
     # --- Benchmarks ---------------------------------------------------------
     with st.spinner("Loading BCB / market data…"):
-        cdi = sgs(cdi_code, start, end) / 100
+        try:
+            cdi = sgs(cdi_code, start, end) / 100
+        except Exception as e:
+            st.error(f"Couldn't download CDI from the Central Bank: {e}. "
+                     "BCB's API is sometimes down; wait a minute and run again.")
+            return
         cdi.index = cdi.index.to_period("M").to_timestamp(how="end").normalize()
 
         def level_or_upload(key, fetch):
@@ -717,11 +743,22 @@ def main():
                     s.resample("ME").apply(lambda x: (1 + x).prod() - 1)
             return fetch()
 
-        imab = level_or_upload(
-            "IMA-B", lambda: to_monthly_returns(sgs(imab_code, start, end)))
+        try:
+            imab = level_or_upload(
+                "IMA-B", lambda: to_monthly_returns(sgs(imab_code, start, end)))
+        except Exception as e:
+            st.error(f"Couldn't download IMA-B from the Central Bank: {e}. Run "
+                     "again in a minute, or upload ANBIMA's IMA-B CSV under "
+                     "'Data sources & advanced'.")
+            return
         ibov = level_or_upload(
             "Ibovespa", lambda: yahoo_monthly_close(ibov_tk, start, end).pct_change())
-        ptax = sgs(ptax_code, start, end).resample("ME").last()
+        try:
+            ptax = sgs(ptax_code, start, end).resample("ME").last()
+        except Exception as e:
+            st.warning(f"PTAX unavailable from BCB ({e}); using USD/BRL from "
+                       "Yahoo Finance instead.")
+            ptax = yahoo_monthly_close("BRL=X", start, end)
 
         def world_brl():
             usd = yahoo_monthly_close(world_tk, start, end)
