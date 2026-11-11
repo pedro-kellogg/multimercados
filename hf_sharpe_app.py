@@ -14,9 +14,11 @@ Data
 Downloads are cached in ./data_cache, so only the first run is slow.
 """
 
-import hashlib
 import io
 import os
+import sys
+import threading
+import time
 import re
 import zipfile
 from datetime import date
@@ -34,6 +36,8 @@ os.makedirs(CACHE, exist_ok=True)
 
 CVM_DAILY = "https://dados.cvm.gov.br/dados/FI/DOC/INF_DIARIO/DADOS/"
 CVM_CAD = "https://dados.cvm.gov.br/dados/FI/CAD/DADOS/cad_fi.csv"
+# Post-CVM 175 registry (funds/classes registered or migrated since 2023)
+CVM_CAD_NEW = "https://dados.cvm.gov.br/dados/FI/CAD/DADOS/registro_fundo_classe.zip"
 BCB_SGS = "https://api.bcb.gov.br/dados/serie/bcdata.sgs.{code}/dados"
 NEFIN = "https://nefin.com.br/resources/risk_factors/{name}_Factor.xls"
 HEADERS = {"User-Agent": "Mozilla/5.0 (research script)"}
@@ -69,11 +73,108 @@ def load_registry():
                      dtype=str, low_memory=False)
     keep = ["CNPJ_FUNDO", "DENOM_SOCIAL", "CLASSE", "FUNDO_COTAS",
             "FUNDO_EXCLUSIVO", "CPF_CNPJ_GESTOR", "GESTOR", "DT_CANCEL",
-            "INVEST_QUALIF"]
+            "INVEST_QUALIF", "DT_REG", "DT_CONST", "DT_INI_ATIV"]
     df = df[[c for c in keep if c in df.columns]].copy()
     df["CNPJ_FUNDO"] = df["CNPJ_FUNDO"].str.replace(r"\D", "", regex=True)
     df = df.dropna(subset=["CNPJ_FUNDO"]).drop_duplicates("CNPJ_FUNDO", keep="last")
     return df
+
+
+@st.cache_data(show_spinner=False)
+def load_registry_new():
+    """Names (and manager, if present) from the CVM 175 registry, which covers
+    funds missing from the legacy cad_fi.csv. Column names are matched
+    case-insensitively because CVM has changed them over time."""
+    raw = _cached_bytes(CVM_CAD_NEW, "registro_fundo_classe.zip")
+    out = []
+    with zipfile.ZipFile(io.BytesIO(raw)) as z:
+        for name in z.namelist():
+            if not name.lower().endswith(".csv"):
+                continue
+            with z.open(name) as f:
+                df = pd.read_csv(f, sep=";", encoding="latin-1", dtype=str,
+                                 low_memory=False)
+            low = {c.lower(): c for c in df.columns}
+            name_col = low.get("denominacao_social")
+            if not name_col:
+                continue
+            gest_col = low.get("gestor")
+            for key in ("cnpj_classe", "cnpj_fundo", "cnpj_subclasse"):
+                if key in low:
+                    part = pd.DataFrame({
+                        "CNPJ_FUNDO": df[low[key]].str.replace(r"\D", "", regex=True),
+                        "DENOM_SOCIAL": df[name_col],
+                        "GESTOR": df[gest_col] if gest_col else np.nan})
+                    out.append(part)
+    if not out:
+        return pd.DataFrame(columns=["CNPJ_FUNDO", "DENOM_SOCIAL", "GESTOR"])
+    new = pd.concat(out).dropna(subset=["CNPJ_FUNDO", "DENOM_SOCIAL"])
+    return new.drop_duplicates("CNPJ_FUNDO", keep="last")
+
+
+def enrich_registry(reg, cnpjs, manual_names):
+    """Fill names for selected funds missing from cad_fi.csv (CVM 175
+    registry first, then any name typed next to the CNPJ)."""
+    reg = reg.copy()
+    have = reg.set_index("CNPJ_FUNDO")["DENOM_SOCIAL"]
+    missing = [c for c in cnpjs if pd.isna(have.get(c))]
+    if missing:
+        try:
+            new = load_registry_new()
+            add = new[new["CNPJ_FUNDO"].isin(missing)]
+            reg = pd.concat([reg[~reg["CNPJ_FUNDO"].isin(add["CNPJ_FUNDO"])
+                                 | reg["DENOM_SOCIAL"].notna()], add],
+                            ignore_index=True)
+            reg = reg.drop_duplicates("CNPJ_FUNDO", keep="first")
+        except Exception as e:
+            st.warning(f"Couldn't load the CVM 175 registry for names: {e}")
+    for c, n in manual_names.items():
+        if c in set(reg["CNPJ_FUNDO"]):
+            reg.loc[reg["CNPJ_FUNDO"] == c, "DENOM_SOCIAL"] = n
+        else:
+            reg = pd.concat([reg, pd.DataFrame({"CNPJ_FUNDO": [c],
+                                                "DENOM_SOCIAL": [n]})],
+                            ignore_index=True)
+    return reg
+
+
+_ABBR = [
+    (r"FUNDOS? DE INVESTIMENTO EM COTAS DE FUNDOS DE INVESTIMENTO", "FIC FI"),
+    (r"FUNDO DE INVESTIMENTO EM COTAS DE FUNDOS? DE INVESTIMENTO", "FIC FI"),
+    (r"FUNDO DE INVESTIMENTO EM COTAS", "FIC"),
+    (r"FUNDOS? DE INVESTIMENTO", "FI"),
+    (r"MULTIMERCADO", "MM"), (r"CR[ÉE]DITO PRIVADO", "CP"),
+    (r"INVESTIMENTO NO EXTERIOR", "IE"), (r"RESPONSABILIDADE LIMITADA", "RL"),
+    (r"LONGO PRAZO", "LP"), (r"\bA[ÇC][ÕO]ES\b", "FIA"),
+]
+
+
+def short_name(n, maxlen=45):
+    n = re.sub(r"\s+", " ", str(n).upper()).strip()
+    for pat, rep_ in _ABBR:
+        n = re.sub(pat, rep_, n)
+    n = re.sub(r"\s*-\s*", " - ", n).strip(" -")
+    return n if len(n) <= maxlen else n[:maxlen - 1].rstrip() + "…"
+
+
+def fund_date_bounds(reg, cnpjs):
+    """Earliest start / latest cancel among the selected funds, from the
+    registry, so we only download the years that can contain their data.
+    Returns (None, None) if any fund is missing from the registry."""
+    r = reg[reg["CNPJ_FUNDO"].isin(cnpjs)]
+    if len(r) < len(set(cnpjs)):
+        return None, None
+    dcols = [c for c in ["DT_INI_ATIV", "DT_CONST", "DT_REG"] if c in r]
+    first = None
+    if dcols:
+        starts = pd.concat([pd.to_datetime(r[c], errors="coerce")
+                            for c in dcols], axis=1).min(axis=1)
+        first = starts.min() if starts.notna().all() else None
+    last = None
+    if "DT_CANCEL" in r:
+        cancel = pd.to_datetime(r["DT_CANCEL"], errors="coerce")
+        last = cancel.max() if cancel.notna().all() else None
+    return first, last
 
 
 def _daily_file_list(start_year, end_date):
@@ -92,63 +193,102 @@ def _daily_file_list(start_year, end_date):
     return files
 
 
-def _parse_daily_zip(content, cnpjs):
-    """Month-end quota, AUM and quotaholders for the given CNPJs."""
+def _parse_daily_zip(path):
+    """Month-end quota, AUM and quotaholders for ALL funds in one CVM file."""
+    want = {"DT_COMPTC", "VL_QUOTA", "VL_PATRIM_LIQ", "NR_COTST"}
     out = []
-    with zipfile.ZipFile(io.BytesIO(content)) as z:
+    with zipfile.ZipFile(path) as z:
         for name in z.namelist():
             if not name.lower().endswith(".csv"):
                 continue
             with z.open(name) as f:
-                df = pd.read_csv(
-                    f, sep=";", encoding="latin-1", dtype=str, low_memory=False,
-                    usecols=lambda c: c.startswith("CNPJ_FUNDO") or c in
-                    {"DT_COMPTC", "VL_QUOTA", "VL_PATRIM_LIQ", "NR_COTST"})
-            # Pre/post CVM 175 column names (CNPJ_FUNDO vs CNPJ_FUNDO_CLASSE)
-            ren = {}
-            for c in df.columns:
-                if c.startswith("CNPJ_FUNDO"):
-                    ren[c] = "CNPJ_FUNDO"
-            df = df.rename(columns=ren)
+                header = f.readline().decode("latin-1").strip().split(";")
+            cnpj_col = next(c for c in header if c.startswith("CNPJ_FUNDO"))
+            cols = [cnpj_col] + [c for c in header if c in want]
+            try:  # pyarrow parser: several times faster than the C parser
+                with z.open(name) as f:
+                    df = pd.read_csv(f, sep=";", encoding="latin-1", usecols=cols,
+                                     engine="pyarrow", dtype={cnpj_col: str})
+            except Exception:
+                with z.open(name) as f:
+                    df = pd.read_csv(f, sep=";", encoding="latin-1", usecols=cols,
+                                     dtype={cnpj_col: str})
+            df = df.rename(columns={cnpj_col: "CNPJ_FUNDO"})
             df["CNPJ_FUNDO"] = df["CNPJ_FUNDO"].str.replace(r"\D", "", regex=True)
-            df = df[df["CNPJ_FUNDO"].isin(list(cnpjs))]
-            if df.empty:
-                continue
             df["DT"] = pd.to_datetime(df["DT_COMPTC"], errors="coerce")
             for c in ["VL_QUOTA", "VL_PATRIM_LIQ", "NR_COTST"]:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
             # Post-175 files can carry subclasses: keep the largest row
             df = (df.sort_values("VL_PATRIM_LIQ")
                     .drop_duplicates(["CNPJ_FUNDO", "DT"], keep="last"))
-            df["M"] = df["DT"].dt.to_period("M")
-            df = (df.sort_values("DT")
-                    .groupby(["CNPJ_FUNDO", "M"]).tail(1))
+            df["M"] = df["DT"].dt.to_period("M").astype(str)
+            df = df.sort_values("DT").groupby(["CNPJ_FUNDO", "M"]).tail(1)
             out.append(df[["CNPJ_FUNDO", "M", "DT", "VL_QUOTA",
                            "VL_PATRIM_LIQ", "NR_COTST"]])
-    return pd.concat(out) if out else pd.DataFrame()
+    return pd.concat(out, ignore_index=True) if out else pd.DataFrame()
 
 
-def load_fund_panel(start_year, end_date, cnpjs, progress):
+_PARSE_SLOTS = threading.Semaphore(2)
+
+
+def _download(url, path):
+    """Stream to disk (keeps memory low on Streamlit Cloud)."""
+    tmp = path + ".part"
+    with requests.get(url, headers=HEADERS, stream=True, timeout=600) as r:
+        r.raise_for_status()
+        with open(tmp, "wb") as f:
+            for chunk in r.iter_content(1 << 20):
+                f.write(chunk)
+    os.replace(tmp, path)
+
+
+def _monthly_file(url, fname, label, keep_zip=False):
+    """Download + reduce one CVM file to a small month-end parquet for all
+    funds. Cached forever (except the current month, which is still filling)."""
+    pq = os.path.join(CACHE, f"me_{label}.parquet")
+    current = label == date.today().strftime("%Y%m")
+    if os.path.exists(pq) and not current:
+        return pd.read_parquet(pq)
+    zpath = os.path.join(CACHE, fname)
+    if not os.path.exists(zpath) or current:
+        _download(url, zpath)
+    with _PARSE_SLOTS:  # cap concurrent parses so big yearly files fit in RAM
+        part = _parse_daily_zip(zpath)
+    part.to_parquet(pq, index=False)
+    if not keep_zip:
+        os.remove(zpath)  # the raw zip is no longer needed
+    return part
+
+
+def load_fund_panel(start_year, end_date, cnpjs, progress=None, workers=6):
+    """Month-end panel for the given CNPJs. Files are fetched in parallel and
+    each is reduced once for all funds, so changing CNPJs later is instant."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     files = _daily_file_list(start_year, end_date)
-    frames = []
-    key = hashlib.md5(",".join(sorted(cnpjs)).encode()).hexdigest()[:10]
-    for i, (url, fname, label) in enumerate(files):
-        progress.progress((i + 1) / len(files), text=f"CVM daily data: {label}")
-        pq = os.path.join(CACHE, f"panel_{label}_{key}.parquet")
-        if os.path.exists(pq):
-            frames.append(pd.read_parquet(pq))
-            continue
-        try:
-            content = _cached_bytes(url, fname)
-        except Exception as e:  # file not yet published, etc.
-            st.warning(f"Skipped {label}: {e}")
-            continue
-        part = _parse_daily_zip(content, cnpjs)
-        if not part.empty:
-            part = part.astype({"M": str})
-            part.to_parquet(pq)
-            frames.append(part)
+    cn = list(cnpjs)
+    frames, failed, done = [], [], 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_monthly_file, *f): f[2] for f in files}
+        for fut in as_completed(futs):
+            label = futs[fut]
+            done += 1
+            if progress is not None:
+                progress.progress(done / len(files),
+                                  text=f"CVM data: {done}/{len(files)} files")
+            try:
+                part = fut.result()
+            except Exception as e:  # e.g. file not yet published
+                failed.append(f"{label} ({type(e).__name__})")
+                continue
+            if not part.empty:
+                frames.append(part[part["CNPJ_FUNDO"].isin(cn)])
+    if failed and progress is not None:
+        st.warning("Skipped CVM files: " + ", ".join(sorted(failed)))
+    if not frames:
+        return pd.DataFrame()
     panel = pd.concat(frames, ignore_index=True)
+    if panel.empty:
+        return panel
     panel["M"] = pd.PeriodIndex(panel["M"], freq="M")
     panel = (panel.sort_values("DT")
                   .drop_duplicates(["CNPJ_FUNDO", "M"], keep="last"))
@@ -251,12 +391,11 @@ def build_sleeve(panel, reg, cnpj_list, weighting, max_abs_ret):
     sleeve.index = sleeve.index.to_timestamp(how="end").normalize()
 
     # Readable, unique labels per fund
-    names = (df.groupby("CNPJ_FUNDO")["DENOM_SOCIAL"].first()
-               .fillna(pd.Series(df["CNPJ_FUNDO"].unique(),
-                                 index=df["CNPJ_FUNDO"].unique())))
+    names = df.groupby("CNPJ_FUNDO")["DENOM_SOCIAL"].first()
     labels = {}
     for c, n in names.items():
-        lab = str(n)[:38].strip()
+        lab = short_name(n) if pd.notna(n) else \
+            f"{c[:2]}.{c[2:5]}.{c[5:8]}/{c[8:12]}-{c[12:]}"
         labels[c] = lab if lab not in labels.values() else f"{lab} ({c[:8]})"
 
     wide = df.pivot(index="M", columns="CNPJ_FUNDO", values="ret")
@@ -354,7 +493,7 @@ def portfolio(rets, w):
 NUM_FMT = ",.2f"  # #,##0.00
 
 
-def line_chart(data, y_title="", x_title=None, height=380):
+def line_chart(data, y_title="", x_title=None, height=380, y_fmt=NUM_FMT):
     """Altair line chart: #,##0.00 axis labels and a bold end-of-line label
     in each series' colour."""
     df = data.to_frame() if isinstance(data, pd.Series) else data.copy()
@@ -369,7 +508,7 @@ def line_chart(data, y_title="", x_title=None, height=380):
               title=None if temporal else x_title,
               axis=alt.Axis(format="%Y", tickCount="year") if temporal
               else alt.Axis(format=NUM_FMT))
-    y = alt.Y("Value:Q", title=y_title, axis=alt.Axis(format=NUM_FMT),
+    y = alt.Y("Value:Q", title=y_title, axis=alt.Axis(format=y_fmt),
               scale=alt.Scale(zero=False))
     color = alt.Color("Series:N", legend=alt.Legend(orient="bottom", title=None))
     lines = alt.Chart(d).mark_line(strokeWidth=2).encode(
@@ -468,9 +607,18 @@ def main():
         st.header("Funds")
         raw_cnpjs = st.text_area(
             "Fund CNPJs (one per line)",
-            placeholder="22.187.946/0001-41\n12.808.980/0001-32")
-        cnpjs = [re.sub(r"\D", "", c).zfill(14)
-                 for c in raw_cnpjs.splitlines() if re.sub(r"\D", "", c)]
+            placeholder="22.187.946/0001-41\n12.808.980/0001-32 ; My label",
+            help="Names come from the CVM registry. To set your own label, "
+                 "add it after the CNPJ (e.g. '12.808.980/0001-32 ; SPX').")
+        cnpjs, manual_names = [], {}
+        for line in raw_cnpjs.splitlines():
+            mt = re.match(r"\s*([\d./-]{11,20})\s*[;,|]?\s*(.*)$", line)
+            if not mt or not re.sub(r"\D", "", mt.group(1)):
+                continue
+            c = re.sub(r"\D", "", mt.group(1)).zfill(14)
+            cnpjs.append(c)
+            if mt.group(2).strip():
+                manual_names[c] = mt.group(2).strip()
         weighting = st.radio("Sleeve weighting (if several funds)",
                              ["Equal", "AUM"])
 
@@ -532,15 +680,23 @@ def main():
     # --- Registry & universe ------------------------------------------------
     with st.spinner("Loading CVM fund registry…"):
         reg = load_registry()
+    reg = enrich_registry(reg, cnpjs, manual_names)
     unknown = [c for c in cnpjs if c not in set(reg["CNPJ_FUNDO"])]
     if unknown:
-        st.warning("Not in the CVM registry (names will be blank, data "
-                   f"still loaded if reported): {', '.join(unknown)}")
+        st.warning("Not in the CVM registries (shown by CNPJ unless you add "
+                   f"a label next to it): {', '.join(unknown)}")
     universe = frozenset(cnpjs)
 
+    # Only fetch years that can contain these funds' data
+    first, last_c = fund_date_bounds(reg, cnpjs)
+    y0 = (start_m - 1).year
+    if first is not None and first.year > y0:
+        y0 = first.year
+    t1 = end_m.to_timestamp(how="end")
+    if last_c is not None and last_c < t1:
+        t1 = last_c
     prog = st.progress(0.0)
-    panel = load_fund_panel((start_m - 1).year, end_m.to_timestamp(how="end"),
-                            universe, prog)
+    panel = load_fund_panel(y0, t1, universe, prog)
     prog.empty()
     if panel.empty:
         st.error("No CVM data found for this universe.")
@@ -643,7 +799,7 @@ def main():
                 f"(*{fund_cagr.index[0]}*), vs CDI {_pct(cagr['CDI'])}/yr and "
                 f"Ibovespa {_pct(cagr['Ibovespa'])}/yr.")
             st.subheader("Cumulative return (rebased to 100)")
-            line_chart(lv, "Index (start = 100)")
+            line_chart(lv, "Index (start = 100)", y_fmt=",.0f")
 
     # --- Summary ------------------------------------------------------------
     with tabs[1]:
@@ -664,7 +820,7 @@ def main():
         st.subheader("Building blocks")
         st.dataframe(assets.style.format(fmt))
         st.subheader("Cumulative excess return over CDI (start = 100)")
-        line_chart((1 + P.sub(rf, axis=0)).cumprod() * 100, "Index")
+        line_chart((1 + P.sub(rf, axis=0)).cumprod() * 100, "Index", y_fmt=",.0f")
 
     # --- Sharpe tests -------------------------------------------------------
     with tabs[2]:
@@ -770,7 +926,7 @@ def main():
                        "Sharpe as the true one, so it understates the horizon "
                        "when the Sharpe is estimated from a short history.")
             st.subheader("Probability of beating CDI by holding period (%)")
-            line_chart(pd.DataFrame(probs), "%", "Years held")
+            line_chart(pd.DataFrame(probs), "%", "Years held", y_fmt=",.0f")
 
     # --- Correlations ---------------------------------------------------------
     with tabs[5]:
@@ -919,10 +1075,10 @@ def main():
         roll = P.sub(rf, axis=0).rolling(36)
         line_chart(roll.mean() / roll.std() * np.sqrt(12), "Sharpe")
         st.subheader("Rolling 36-month HF alpha (ann., %)")
-        line_chart(alphas.rename("HF alpha") * 100, "% per year")
+        line_chart(alphas.rename("HF alpha") * 100, "% per year", y_fmt=",.0f")
         st.subheader("Drawdowns (%)")
         wealth = (1 + P).cumprod()
-        line_chart((wealth / wealth.cummax() - 1) * 100, "%")
+        line_chart((wealth / wealth.cummax() - 1) * 100, "%", y_fmt=",.0f")
         st.subheader("Returns in Ibovespa's worst months")
         st.write(pd.DataFrame({
             "Avg return, worst 10% Ibov months": R[worst][["Ibovespa", "HF"]].mean(),
@@ -947,5 +1103,20 @@ def main():
                            pd.concat([R, P, fund_rets], axis=1).to_csv(),
                            "monthly_returns.csv")
 
+def build_cache(start_year=2009):
+    """Pre-build the month-end cache (run locally, then commit data_cache/
+    me_*.parquet to the repo so Streamlit Cloud never downloads CVM files)."""
+    t0 = time.time()
+    panel_files = _daily_file_list(start_year, pd.Timestamp(date.today()))
+    print(f"Building {len(panel_files)} files into {CACHE} …")
+    load_registry()
+    load_fund_panel(start_year, pd.Timestamp(date.today()), [], None)
+    print(f"Done in {time.time() - t0:,.0f}s")
+
+
 if __name__ == "__main__":
-    main()
+    if "--build-cache" in sys.argv:
+        i = sys.argv.index("--build-cache")
+        build_cache(int(sys.argv[i + 1]) if len(sys.argv) > i + 1 else 2009)
+    else:
+        main()
