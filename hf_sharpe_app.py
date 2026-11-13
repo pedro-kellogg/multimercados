@@ -9,7 +9,6 @@ Data
 - CVM open data: daily fund quotas/AUM (informe diário) + fund registry (cad_fi)
 - BCB SGS: CDI (monthly), IMA-B, PTAX USD/BRL
 - Yahoo Finance: Ibovespa, MSCI World ETF (USD -> BRL via PTAX)
-- NEFIN (optional): Brazilian equity factors
 
 Downloads are cached in ./data_cache, so only the first run is slow.
 """
@@ -39,7 +38,6 @@ CVM_CAD = "https://dados.cvm.gov.br/dados/FI/CAD/DADOS/cad_fi.csv"
 # Post-CVM 175 registry (funds/classes registered or migrated since 2023)
 CVM_CAD_NEW = "https://dados.cvm.gov.br/dados/FI/CAD/DADOS/registro_fundo_classe.zip"
 BCB_SGS = "https://api.bcb.gov.br/dados/serie/bcdata.sgs.{code}/dados"
-NEFIN = "https://nefin.com.br/resources/risk_factors/{name}_Factor.xls"
 HEADERS = {"User-Agent": "Mozilla/5.0 (research script)"}
 
 
@@ -296,7 +294,7 @@ def load_fund_panel(start_year, end_date, cnpjs, progress=None, workers=6):
 
 
 # ----------------------------------------------------------------------------
-# BCB / Yahoo / NEFIN
+# BCB / Yahoo
 # ----------------------------------------------------------------------------
 def _sgs_chunk(code, s, e, tries=4):
     """One SGS request with retries. BCB sometimes answers with an empty or
@@ -351,24 +349,6 @@ def yahoo_monthly_close(ticker, start, end):
     return px.resample("ME").last()
 
 
-@st.cache_data(show_spinner=False)
-def nefin_factors():
-    out = {}
-    for name in ["Market", "SMB", "HML", "WML", "IML"]:
-        try:
-            raw = _cached_bytes(NEFIN.format(name=name), f"nefin_{name}.xls")
-            df = pd.read_excel(io.BytesIO(raw))
-            df.columns = [c.lower() for c in df.columns]
-            df["date"] = pd.to_datetime(df[["year", "month", "day"]])
-            col = [c for c in df.columns if c not in
-                   ("year", "month", "day", "date")][0]
-            d = df.set_index("date")[col]
-            out[name] = (1 + d).resample("ME").prod() - 1
-        except Exception:
-            pass
-    return pd.DataFrame(out)
-
-
 def to_monthly_returns(level):
     return level.resample("ME").last().pct_change()
 
@@ -411,13 +391,8 @@ def build_sleeve(panel, reg, cnpj_list, weighting, max_abs_ret):
     sleeve = pd.DataFrame(rows).set_index("M").sort_index()
     sleeve.index = sleeve.index.to_timestamp(how="end").normalize()
 
-    # Readable, unique labels per fund
-    names = df.groupby("CNPJ_FUNDO")["DENOM_SOCIAL"].first()
-    labels = {}
-    for c, n in names.items():
-        lab = short_name(n) if pd.notna(n) else \
-            f"{c[:2]}.{c[2:5]}.{c[5:8]}/{c[8:12]}-{c[12:]}"
-        labels[c] = lab if lab not in labels.values() else f"{lab} ({c[:8]})"
+    # Generic labels in input order (legend at the bottom maps them to names)
+    labels = {c: f"Fund {i + 1}" for i, c in enumerate(dict.fromkeys(cnpj_list))}
 
     wide = df.pivot(index="M", columns="CNPJ_FUNDO", values="ret")
     wide.index = wide.index.to_timestamp(how="end").normalize()
@@ -431,7 +406,14 @@ def build_sleeve(panel, reg, cnpj_list, weighting, max_abs_ret):
     info["last_aum_mm"] /= 1e6
     info["first_month"] = info["first_month"].astype(str)
     info["last_month"] = info["last_month"].astype(str)
-    return sleeve, wide, info.reset_index().rename(columns={"CNPJ_FUNDO": "cnpj"})
+    info = info.reindex(list(labels)).rename_axis("CNPJ_FUNDO").reset_index()
+    info.insert(0, "Label", info["CNPJ_FUNDO"].map(labels))
+    info["CNPJ"] = info.pop("CNPJ_FUNDO").map(
+        lambda c: f"{c[:2]}.{c[2:5]}.{c[5:8]}/{c[8:12]}-{c[12:]}")
+    nm = reg.set_index("CNPJ_FUNDO")["DENOM_SOCIAL"]
+    info["fund"] = info["fund"].fillna(
+        info["CNPJ"].str.replace(r"\D", "", regex=True).map(nm))
+    return sleeve, wide, info
 
 
 # ----------------------------------------------------------------------------
@@ -487,17 +469,10 @@ def ann_stats(r, rf):
 
 
 def hac_ols(y, X, lags=6):
-    X = sm.add_constant(X)
+    X = sm.add_constant(X, has_constant="add")
     d = pd.concat([y, X], axis=1).dropna()
     return sm.OLS(d.iloc[:, 0], d.iloc[:, 1:]).fit(
         cov_type="HAC", cov_kwds={"maxlags": lags})
-
-
-def tangency_sharpe(ex):
-    ex = ex.dropna()
-    mu = ex.mean().values
-    S = np.cov(ex.values, rowvar=False)
-    return float(np.sqrt(mu @ np.linalg.solve(S, mu)) * np.sqrt(12))
 
 
 def portfolio(rets, w):
@@ -546,6 +521,77 @@ def line_chart(data, y_title="", x_title=None, height=380, y_fmt=NUM_FMT):
     chart = (lines + labels).properties(
         height=height, padding={"left": 5, "top": 10, "right": 80, "bottom": 5})
     st.altair_chart(chart, width="stretch")
+
+
+def corr_heatmap(corr, cell=64):
+    """Correlation matrix as equal-size square cells."""
+    order = list(corr.columns)
+    d = (corr.rename_axis("Row").reset_index()
+             .melt("Row", var_name="Col", value_name="Corr").dropna())
+    base = alt.Chart(d).encode(
+        x=alt.X("Col:N", sort=order, title=None,
+                axis=alt.Axis(orient="top", labelAngle=0, labelLimit=cell + 20)),
+        y=alt.Y("Row:N", sort=order, title=None))
+    rect = base.mark_rect(stroke="#888", strokeWidth=0.5).encode(
+        color=alt.Color("Corr:Q", scale=alt.Scale(scheme="redblue", domain=[1, -1]),
+                        legend=None),
+        tooltip=["Row", "Col", alt.Tooltip("Corr:Q", format=".2f")])
+    text = base.mark_text(fontSize=13).encode(
+        text=alt.Text("Corr:Q", format=".2f"),
+        color=alt.condition("abs(datum.Corr) > 0.55", alt.value("white"),
+                            alt.value("#222")))
+    n = len(order)
+    st.altair_chart((rect + text).properties(width=cell * n, height=cell * n),
+                    width="content")
+
+
+def dist_chart(r, name, height=260):
+    """Histogram of monthly returns + smoothed density vs a normal bell."""
+    from scipy.stats import gaussian_kde
+    x = r.dropna().values * 100
+    if len(x) < 24:
+        st.caption(f"{name}: not enough data.")
+        return
+    mu, sd = x.mean(), x.std(ddof=1)
+    lo, hi = min(x.min(), mu - 4 * sd), max(x.max(), mu + 4 * sd)
+    pad = (hi - lo) * 0.04
+    lo, hi = lo - pad, hi + pad
+    grid = np.linspace(lo, hi, 300)
+    counts, edges = np.histogram(x, bins=min(30, max(10, int(np.sqrt(len(x)) * 2))),
+                                 density=True)
+    hist = pd.DataFrame({"x0": edges[:-1], "x1": edges[1:], "d": counts})
+    lines = pd.concat([
+        pd.DataFrame({"x": grid, "d": gaussian_kde(x)(grid), "Curve": "Actual shape"}),
+        pd.DataFrame({"x": grid, "d": norm.pdf(grid, mu, sd), "Curve": "Normal bell"})])
+    worst, var5 = x.min(), np.percentile(x, 5)
+    s, k = pd.Series(x).skew(), pd.Series(x).kurt()
+    xs = alt.X("x:Q", title="Monthly return (%)", axis=alt.Axis(format=",.0f"),
+               scale=alt.Scale(domain=[lo, hi], nice=False))
+    bars = alt.Chart(hist).mark_rect(opacity=0.25, color="#4c78a8").encode(
+        x=alt.X("x0:Q", scale=alt.Scale(domain=[lo, hi], nice=False),
+                title="Monthly return (%)", axis=alt.Axis(format=",.0f")),
+        x2="x1:Q", y=alt.Y("d:Q", title=None, axis=alt.Axis(labels=False, ticks=False)))
+    curves = alt.Chart(lines).mark_line(strokeWidth=2).encode(
+        x=xs, y="d:Q",
+        color=alt.Color("Curve:N", scale=alt.Scale(
+            domain=["Actual shape", "Normal bell"], range=["#4c78a8", "#999"]),
+            legend=alt.Legend(orient="bottom", title=None)),
+        strokeDash=alt.StrokeDash("Curve:N", scale=alt.Scale(
+            domain=["Actual shape", "Normal bell"], range=[[1, 0], [5, 4]]),
+            legend=None))
+    marks = pd.DataFrame({"x": [worst, var5], "lab": [f"Worst {worst:,.2f}%",
+                                                       f"VaR 5% {var5:,.2f}%"],
+                          "c": ["#d62728", "#ff7f0e"]})
+    rules = alt.Chart(marks).mark_rule(strokeWidth=1.5).encode(
+        x=xs, color=alt.Color("c:N", scale=None))
+    labs = alt.layer(*[
+        alt.Chart(marks.iloc[[i]]).mark_text(
+            align="left", dx=4, fontWeight="bold", baseline="top", y=4 + 16 * i).encode(
+            x=xs, text="lab:N", color=alt.Color("c:N", scale=None))
+        for i in range(len(marks))])
+    title = f"{name} · skew {s:.2f} · excess kurtosis {k:.2f}"
+    st.altair_chart((bars + curves + rules + labs).properties(
+        height=height, title=title), width="stretch")
 
 
 # ----------------------------------------------------------------------------
@@ -792,7 +838,7 @@ def main():
 
     tabs = st.tabs(["Performance", "Summary", "Sharpe tests", "Optimal size",
                     "Horizon", "Correlations", "Tail risk",
-                    "Spanning & factors", "Robustness", "Funds"])
+                    "Factor regression", "Robustness"])
     # Each fund aligned with the benchmarks over the window (own history)
     win = slice(start_m.to_timestamp(), end_m.to_timestamp(how="end"))
     bench = pd.concat({"CDI": cdi, "IMA-B": imab, "Ibovespa": ibov,
@@ -990,8 +1036,7 @@ def main():
                    "to each other." if pair else
                    "Lower correlation with the baseline means more diversification "
                    "per unit of risk."))
-        st.dataframe(corr.style.format("{:.2f}").background_gradient(
-            cmap="RdBu_r", vmin=-1, vmax=1), width="stretch")
+        corr_heatmap(corr)
         st.caption("Monthly returns, pairwise over overlapping months (min. 24). "
                    "CDI is left out: it barely moves, so its correlations are "
                    "not meaningful.")
@@ -1023,47 +1068,82 @@ def main():
         st.caption("Skew < 0 and high kurtosis = fat left tail. CVaR 5% = "
                    "average return in the worst 5% of months.")
 
-    # --- Spanning / factors ---------------------------------------------------
+        st.subheader("Return distributions vs a normal bell")
+        st.caption("Bars: actual monthly returns. Solid line: their smoothed "
+                   "shape (this is where skew and kurtosis show up). Dashed "
+                   "line: a normal bell with the same mean and volatility. "
+                   "Where the solid line sits above the dashed one in the "
+                   "left tail, losses are fatter than a normal model assumes. "
+                   "Red line: worst month; orange: 5% VaR.")
+        dist_items = list(series.items()) + [("Ibovespa", bench["Ibovespa"]),
+                                             ("Baseline", base_full)]
+        for i in range(0, len(dist_items), 2):
+            cols = st.columns(2)
+            for col, (name, r) in zip(cols, dist_items[i:i + 2]):
+                with col:
+                    dist_chart(r, name)
+
+    # --- Factor regression ----------------------------------------------------
     with tabs[7]:
-        m1 = hac_ols(ex["HF"], ex[risky])
-        a, se_eps = m1.params["const"], np.sqrt(m1.scale)
-        sr_base = tangency_sharpe(ex[risky])
-        ar = a / se_eps * np.sqrt(12)
-        sr_new = np.sqrt(sr_base**2 + ar**2) if a > 0 else sr_base
-
-        F = ex[risky].copy()
-        F["USD/BRL"] = fx.reindex(F.index)
-        nf = nefin_factors()
-        if not nf.empty:
-            F = F.join(nf.drop(columns="Market", errors="ignore"), how="left")
-        F = F.dropna(axis=1, how="all")
-        m2 = hac_ols(ex["HF"], F)
-        a2, t2 = m2.params["const"] * 12, m2.tvalues["const"]
-
-        st.info(
-            f"Against the baseline assets, HF alpha is **{_pct(a*12)}/yr** "
-            f"(t = {m1.tvalues['const']:.2f}); in-sample it would lift the best "
-            f"achievable Sharpe from {sr_base:.2f} to {sr_new:.2f}. "
-            f"Adding FX{' and NEFIN' if not nf.empty else ''} factors, alpha is "
-            f"{_pct(a2)}/yr (t = {t2:.2f}), so it "
-            + ("**survives** the factor controls." if abs(t2) >= 2 and a2 > 0 else
-               "is **not robust** to factor controls (much of it looks like "
-               "replicable exposure or noise)."))
-        st.subheader("Spanning regression: HF excess on baseline assets")
-        st.text(m1.summary().tables[1].as_text())
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Alpha (ann.)", _pct(a * 12))
-        c2.metric("Appraisal ratio (ann.)", f"{ar:.2f}")
-        c3.metric("Tangency Sharpe, base", f"{sr_base:.2f}")
-        c4.metric("Tangency Sharpe, + HF", f"{sr_new:.2f}")
-        st.caption("Positive, significant alpha ⇒ HF expands the efficient "
-                   "frontier: SR²(new) = SR²(old) + (α/σε)². In-sample "
-                   "tangency Sharpes are upper bounds.")
-        st.subheader("Factor regression (is the alpha cheap beta?)")
-        if nf.empty:
-            st.warning("NEFIN factors unavailable; using baseline assets + FX.")
-        st.text(m2.summary().tables[1].as_text())
-        st.caption(f"R² = {m2.rsquared:.2f}, N = {int(m2.nobs)}")
+        fac = pd.concat([bench["CDI"], bench["IMA-B"], bench["Ibovespa"],
+                         bench["World"], fx.reindex(bench.index).rename("USD/BRL")],
+                        axis=1)
+        fnames_ = ["CDI", "IMA-B", "Ibovespa", "World", "USD/BRL"]
+        rows, betas = [], {}
+        for name, r in series.items():
+            m = hac_ols(r.rename("y"), fac)
+            if m.nobs < 24:
+                continue
+            row = {"Fund": name,
+                   "Alpha (ann.)": m.params["const"] * 12,
+                   "t(alpha)": m.tvalues["const"]}
+            for f in fnames_:
+                row[f"β {f}"] = m.params[f]
+                row[f"t {f}"] = m.tvalues[f]
+            row["R²"] = m.rsquared
+            row["Months"] = int(m.nobs)
+            rows.append(row)
+            betas[name] = m.params[fnames_]
+        FR = pd.DataFrame(rows).set_index("Fund") if rows else pd.DataFrame()
+        if FR.empty:
+            st.warning("No fund has 24+ months of data in the window.")
+        else:
+            sig = FR[(FR["t(alpha)"] >= 2) & (FR["Alpha (ann.)"] > 0)].index.tolist()
+            ex_cols = [f for f in fnames_ if f != "CDI"]
+            top = FR[[f"β {f}" for f in ex_cols]].abs().stack().idxmax()
+            st.info(
+                (f"**{', '.join(sig)}** show{'s' if len(sig) == 1 else ''} positive, "
+                 f"significant alpha (t ≥ 2) after controlling for all five factors"
+                 if sig else "No fund shows statistically significant alpha after "
+                 "controlling for the five factors")
+                + f"; these factors explain {FR['R²'].min():.0%}–{FR['R²'].max():.0%} "
+                f"of return variance. The largest market exposure is *{top[0]}* to "
+                f"**{top[1].replace('β ', '')}** (β = {FR.loc[top]:.2f}).")
+            show = FR.copy()
+            star = lambda t: "***" if abs(t) >= 3.3 else "**" if abs(t) >= 2.6 \
+                else "*" if abs(t) >= 2 else ""
+            for c in ["Alpha (ann.)"] + [f"β {f}" for f in fnames_]:
+                tcol = "t(alpha)" if c.startswith("Alpha") else f"t {c[2:]}"
+                fmt = "{:.2%}" if c.startswith("Alpha") else "{:.2f}"
+                show[c] = [fmt.format(v) + star(t) for v, t in zip(FR[c], FR[tcol])]
+            show = show[["Alpha (ann.)"] + [f"β {f}" for f in fnames_] + ["R²", "Months"]]
+            st.dataframe(show.style.format({"R²": "{:.2f}", "Months": "{:.0f}"}),
+                         width="stretch")
+            st.caption("Monthly fund return = α + β·(CDI, IMA-B, Ibovespa, World "
+                       "in BRL, USD/BRL) + ε; Newey-West t-stats. * |t|≥2, "
+                       "** |t|≥2.6, *** |t|≥3.3. β CDI ≈ the 'cash/carry' part of the "
+                       "fund; alpha is what none of the five factors explain.")
+            st.subheader("Factor exposures (β)")
+            bdf = (pd.DataFrame(betas).T.rename_axis("Fund").reset_index()
+                     .melt("Fund", var_name="Factor", value_name="Beta"))
+            bars = alt.Chart(bdf).mark_bar().encode(
+                x=alt.X("Factor:N", sort=fnames_, title=None,
+                        axis=alt.Axis(labelAngle=0)),
+                xOffset=alt.XOffset("Fund:N"),
+                y=alt.Y("Beta:Q", axis=alt.Axis(format=NUM_FMT), title="β"),
+                color=alt.Color("Fund:N", legend=alt.Legend(orient="bottom", title=None)),
+                tooltip=["Fund", "Factor", alt.Tooltip("Beta:Q", format=NUM_FMT)])
+            st.altair_chart(bars.properties(height=320), width="stretch")
 
     # --- Robustness -----------------------------------------------------------
     with tabs[8]:
@@ -1122,23 +1202,24 @@ def main():
             "Avg return, other months": R[~worst][["Ibovespa", "HF"]].mean(),
         }).style.format("{:.2%}"))
 
-    # --- Funds --------------------------------------------------------------
-    with tabs[9]:
-        dead = info[info["last_month"] < str(end_m)]
-        st.info(
-            f"**{len(info)}** fund(s) with data. "
-            + (f"{len(dead)} stopped reporting before {end_m.strftime('%b %Y')} "
-               "(closed, merged or migrated) and are kept until their last month."
-               if len(dead) else "All report through the end of the sample.")
-            + f" The blended sleeve holds {sleeve['n_funds'].loc[R.index].mean():.1f} "
-              "funds on average.")
-        st.dataframe(info.style.format({"last_aum_mm": "R$ {:,.0f} mm"}),
-                     width="stretch")
-        st.subheader("Number of live funds in sleeve")
-        line_chart(sleeve["n_funds"].loc[win].rename("Live funds"), "Funds")
-        st.download_button("Download monthly returns (CSV)",
-                           pd.concat([R, P, fund_rets], axis=1).to_csv(),
-                           "monthly_returns.csv")
+    # --- Fund legend (below all tabs) ----------------------------------------
+    st.divider()
+    st.subheader("Fund legend")
+    leg = info.rename(columns={"fund": "Fund name", "manager": "Manager",
+                               "first_month": "Data from", "last_month": "Data to",
+                               "last_aum_mm": "Last AUM (R$ mm)"})
+    leg["Data from"] = leg["Data from"].fillna("no CVM data found")
+    leg = leg[["Label", "Fund name", "CNPJ", "Manager", "Data from", "Data to",
+               "Last AUM (R$ mm)"]]
+    st.dataframe(leg.style.format({"Last AUM (R$ mm)": "{:,.0f}"}, na_rep="–"),
+                 hide_index=True, width="stretch")
+    if len(info) > 1:
+        st.caption(f"HF blend = {weighting.lower()}-weighted mix of all funds "
+                   "above, used as the 'HF' sleeve in the portfolio tabs.")
+    st.download_button("Download monthly returns (CSV)",
+                       pd.concat([R, P, fund_rets], axis=1).to_csv(),
+                       "monthly_returns.csv")
+
 
 def build_cache(start_year=2009):
     """Pre-build the month-end cache (run locally, then commit data_cache/
