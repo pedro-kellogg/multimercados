@@ -30,7 +30,12 @@ import statsmodels.api as sm
 import altair as alt
 from scipy.stats import norm
 
-CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data_cache")
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+CACHE = os.path.join(APP_DIR, "data_cache")
+# ANBIMA Data history file(s) committed to the repo (first one found is used)
+IMAB_FILES = ["data/IMAB-HISTORICO.xls", "data/IMAB-HISTORICO.xlsx",
+              "data/IMAB-HISTORICO.csv", "IMAB-HISTORICO.xls",
+              "IMAB-HISTORICO.xlsx", "IMAB-HISTORICO.csv"]
 os.makedirs(CACHE, exist_ok=True)
 
 CVM_DAILY = "https://dados.cvm.gov.br/dados/FI/DOC/INF_DIARIO/DADOS/"
@@ -347,6 +352,102 @@ def yahoo_monthly_close(ticker, start, end):
     if isinstance(px, pd.DataFrame):
         px = px.iloc[:, 0]
     return px.resample("ME").last()
+
+
+def _num(s):
+    """Numbers that may come as Brazilian text ('12.006,00')."""
+    if s.dtype == object:
+        s = s.astype(str).str.strip()
+        br = s.str.contains(",", regex=False)
+        s = s.where(~br, s.str.replace(".", "", regex=False)
+                          .str.replace(",", ".", regex=False))
+    return pd.to_numeric(s, errors="coerce")
+
+
+def read_anbima_index(path):
+    """Daily index levels from an ANBIMA Data 'HISTORICO' export.
+
+    ANBIMA serves an .xls that is really .xlsx, so try openpyxl first, then
+    xlrd (true .xls), then CSV. Columns are found by name: 'Data de
+    Referência' and 'Número Índice'; falls back to the 2nd/3rd columns."""
+    df = None
+    if path.lower().endswith(".csv"):
+        df = pd.read_csv(path, sep=None, engine="python", encoding="latin-1")
+    else:
+        import warnings
+        for eng in ("openpyxl", "xlrd"):
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")  # ANBIMA file has no styles
+                    df = pd.read_excel(path, engine=eng)
+                break
+            except Exception:
+                continue
+    if df is None or df.empty:
+        raise ValueError(f"couldn't read {os.path.basename(path)}")
+    norm_ = {c: re.sub(r"[^a-z]", "", str(c).lower()
+                       .translate(str.maketrans("áâãàéêíóôõúç", "aaaaeeiooouc")))
+             for c in df.columns}
+    dcol = next((c for c, n in norm_.items() if n.startswith("data")), df.columns[1])
+    vcol = next((c for c, n in norm_.items() if "numeroindice" in n), df.columns[2])
+    d = df[dcol]
+    d = d if np.issubdtype(d.dtype, np.datetime64) else \
+        pd.to_datetime(d, dayfirst=True, errors="coerce")
+    lv = pd.Series(_num(df[vcol]).values, index=d).dropna()
+    lv = lv[lv > 0]
+    lv = lv[~lv.index.isna()].sort_index()
+    return lv[~lv.index.duplicated(keep="last")]
+
+
+def last_complete_month(daily_index):
+    """Last calendar month fully covered by a daily series."""
+    last = daily_index.index.max()
+    m = pd.Period(last, "M")
+    return m if last >= (m.to_timestamp(how="end") - pd.offsets.BDay(1)).normalize() \
+        else m - 1
+
+
+def load_imab(sgs_code, start, end_m):
+    """IMA-B monthly returns: ANBIMA file in the repo first; BCB SGS for any
+    months the file is missing (file absent, or older than the window end).
+    Returns (returns, note, warn_flag)."""
+    path = next((os.path.join(APP_DIR, p) for p in IMAB_FILES
+                 if os.path.exists(os.path.join(APP_DIR, p))), None)
+    end_ts = end_m.to_timestamp(how="end")
+    file_r, covered, note = None, None, ""
+    if path:
+        try:
+            lv = read_anbima_index(path)
+            covered = last_complete_month(lv)
+            file_r = to_monthly_returns(lv.loc[:covered.to_timestamp(how="end")])
+            note = (f"IMA-B: ANBIMA file ({os.path.basename(path)}) through "
+                    f"{lv.index.max():%d %b %Y}")
+        except Exception as e:
+            note = f"IMA-B: couldn't read {os.path.basename(path)} ({e})"
+            file_r = None
+    if file_r is not None and covered >= end_m:
+        return file_r, note, False
+
+    # File missing or stale: BCB fills the gap (or everything)
+    gap_from = (covered.to_timestamp() - pd.offsets.MonthEnd(1)).strftime("%Y-%m-%d") \
+        if file_r is not None else start
+    try:
+        sgs_r = to_monthly_returns(sgs(sgs_code, gap_from, end_ts.strftime("%Y-%m-%d")))
+    except Exception as e:
+        if file_r is None:
+            raise
+        return file_r, (note + f"; BCB fill-in failed ({e}), so IMA-B ends "
+                        f"{covered.strftime('%b %Y')}"), True
+    if file_r is None:
+        return sgs_r, ("IMA-B: BCB SGS " + sgs_code
+                       + (" (no ANBIMA file found)" if not note else f" — {note}")), True
+    tail = sgs_r.loc[sgs_r.index > covered.to_timestamp(how="end")]
+    out = pd.concat([file_r, tail]).sort_index()
+    out = out[~out.index.duplicated(keep="first")]
+    msg = note + (f"; {len(tail.dropna())} later month(s) from BCB SGS {sgs_code}"
+                  if len(tail.dropna()) else f"; BCB has nothing after "
+                  f"{covered.strftime('%b %Y')} either")
+    return out, msg + " — re-download the ANBIMA file to refresh.", True
 
 
 def to_monthly_returns(level):
@@ -712,9 +813,12 @@ def main():
             ptax_code = st.text_input("SGS: PTAX USD/BRL", "1")
             ibov_tk = st.text_input("Yahoo: Ibovespa", "^BVSP")
             world_tk = st.text_input("Yahoo: World ETF (USD)", "URTH")
-            st.caption("Optional CSV overrides (date,value). Levels or "
-                       "returns: values > 2 are treated as index levels.")
-            up = {k: st.file_uploader(k, type="csv", key=k)
+            st.caption("IMA-B is read from data/IMAB-HISTORICO.xls (ANBIMA "
+                       "Data export) in the repo; BCB fills any months it "
+                       "doesn't cover. Optional CSV overrides below (date,value; "
+                       "values > 2 are treated as index levels).")
+            up = {k: st.file_uploader(
+                      k, type=["csv", "xls", "xlsx"] if k == "IMA-B" else "csv", key=k)
                   for k in ["IMA-B", "Ibovespa", "World (BRL)"]}
             max_abs = st.number_input(
                 "Data-error filter: ignore fund monthly returns beyond ± (%)",
@@ -790,13 +894,21 @@ def main():
                     s.resample("ME").apply(lambda x: (1 + x).prod() - 1)
             return fetch()
 
+        imab_note, imab_warn = "IMA-B: uploaded file", False
         try:
-            imab = level_or_upload(
-                "IMA-B", lambda: to_monthly_returns(sgs(imab_code, start, end)))
+            if up["IMA-B"] is not None and up["IMA-B"].name.lower().endswith(("xls", "xlsx")):
+                tmp = os.path.join(CACHE, "imab_upload.xlsx")
+                with open(tmp, "wb") as f:
+                    f.write(up["IMA-B"].getvalue())
+                imab = to_monthly_returns(read_anbima_index(tmp))
+            elif up["IMA-B"] is not None:
+                imab = level_or_upload("IMA-B", None)
+            else:
+                imab, imab_note, imab_warn = load_imab(imab_code, start, end_m)
         except Exception as e:
-            st.error(f"Couldn't download IMA-B from the Central Bank: {e}. Run "
-                     "again in a minute, or upload ANBIMA's IMA-B CSV under "
-                     "'Data sources & advanced'.")
+            st.error(f"Couldn't load IMA-B (no ANBIMA file in the repo and the "
+                     f"Central Bank failed: {e}). Add data/IMAB-HISTORICO.xls "
+                     "or upload it under 'Data sources & advanced'.")
             return
         ibov = level_or_upload(
             "Ibovespa", lambda: yahoo_monthly_close(ibov_tk, start, end).pct_change())
@@ -813,6 +925,18 @@ def main():
 
         world = level_or_upload("World (BRL)", world_brl)
         fx = ptax.pct_change()
+
+    # Flag any benchmark that stops before the window ends (it would
+    # silently shorten every portfolio result)
+    ends = {k: v.dropna().index.max() for k, v in
+            {"CDI": cdi, "IMA-B": imab, "Ibovespa": ibov, "World": world}.items()}
+    short = {k: t for k, t in ends.items()
+             if pd.notna(t) and pd.Period(t, "M") < end_m}
+    (st.warning if imab_warn else st.caption)(imab_note)
+    if short:
+        st.warning("These series end before your window does, so portfolio "
+                   "results stop at the earliest one: " + ", ".join(
+                       f"{k} ({t:%b %Y})" for k, t in short.items()))
 
     R = pd.concat({"CDI": cdi, "IMA-B": imab, "Ibovespa": ibov,
                    "World": world, "HF": sleeve["HF"]}, axis=1)
@@ -893,15 +1017,19 @@ def main():
 
         if lv is not None:
             st.subheader("Cumulative return (rebased to 100)")
-            line_chart(lv, "Index (start = 100)", y_fmt=",.0f")
+            line_chart(lv, "Index (start = 100)", y_fmt=",.0f", label_fmt=",.0f")
         else:
             st.warning("No fund returns in the selected window.")
         st.subheader("Cumulative excess return over CDI (start = 100)")
-        line_chart((1 + P.sub(rf, axis=0)).cumprod() * 100, "Index", y_fmt=",.0f")
-        st.subheader("Portfolios")
-        st.dataframe(stats.style.format(fmt))
-        st.subheader("Building blocks")
-        st.dataframe(assets.style.format(fmt))
+        line_chart((1 + P.sub(rf, axis=0)).cumprod() * 100, "Index",
+                   y_fmt=",.0f", label_fmt=",.0f")
+        st.subheader("Building blocks & portfolios")
+        sep_lab = "──── Portfolios ────"
+        sep = pd.DataFrame(np.nan, index=[sep_lab], columns=stats.columns)
+        combo = pd.concat([assets, sep, stats]).astype(float)
+        sty = (combo.style.format(fmt, na_rep="–")
+                     .format(lambda v: "", subset=pd.IndexSlice[[sep_lab], :]))
+        st.dataframe(sty, width="stretch", height=(len(combo) + 1) * 35 + 3)
 
     # --- Sharpe tests -------------------------------------------------------
     with tabs[1]:

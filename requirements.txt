@@ -9,3 +9,4 @@ pyarrow
 xlrd
 altair>=5
 matplotlib
+openpyxl
