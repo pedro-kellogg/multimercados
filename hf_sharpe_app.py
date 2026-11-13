@@ -489,7 +489,8 @@ def portfolio(rets, w):
 NUM_FMT = ",.2f"  # #,##0.00
 
 
-def line_chart(data, y_title="", x_title=None, height=380, y_fmt=NUM_FMT):
+def line_chart(data, y_title="", x_title=None, height=380, y_fmt=NUM_FMT,
+               x_fmt=",.0f", label_fmt=NUM_FMT):
     """Altair line chart: #,##0.00 axis labels and a bold end-of-line label
     in each series' colour."""
     df = data.to_frame() if isinstance(data, pd.Series) else data.copy()
@@ -503,7 +504,7 @@ def line_chart(data, y_title="", x_title=None, height=380, y_fmt=NUM_FMT):
     x = alt.X(f"{xname}:{'T' if temporal else 'Q'}",
               title=None if temporal else x_title,
               axis=alt.Axis(format="%Y", tickCount="year") if temporal
-              else alt.Axis(format=NUM_FMT))
+              else alt.Axis(format=x_fmt))
     y = alt.Y("Value:Q", title=y_title, axis=alt.Axis(format=y_fmt),
               scale=alt.Scale(zero=False))
     color = alt.Color("Series:N", legend=alt.Legend(orient="bottom", title=None))
@@ -511,12 +512,12 @@ def line_chart(data, y_title="", x_title=None, height=380, y_fmt=NUM_FMT):
         x=x, y=y, color=color,
         tooltip=["Series:N",
                  alt.Tooltip(f"{xname}:{'T' if temporal else 'Q'}",
-                             format="%b %Y" if temporal else NUM_FMT),
+                             format="%b %Y" if temporal else ",.2f"),
                  alt.Tooltip("Value:Q", format=NUM_FMT)])
     ends = d.sort_values(xname).groupby("Series").tail(1)
     labels = alt.Chart(ends).mark_text(
         align="left", dx=6, fontWeight="bold", fontSize=12).encode(
-        x=x, y=y, text=alt.Text("Value:Q", format=NUM_FMT),
+        x=x, y=y, text=alt.Text("Value:Q", format=label_fmt),
         color=alt.Color("Series:N", legend=None))
     chart = (lines + labels).properties(
         height=height, padding={"left": 5, "top": 10, "right": 80, "bottom": 5})
@@ -836,9 +837,8 @@ def main():
     ex = R.sub(rf, axis=0).drop(columns="CDI")
     risky = ["IMA-B", "Ibovespa", "World"]
 
-    tabs = st.tabs(["Summary", "Sharpe tests", "Optimal size",
-                    "Horizon", "Correlations", "Tail risk",
-                    "Factor regression", "Robustness"])
+    tabs = st.tabs(["Summary", "Sharpe & sizing", "Horizon",
+                    "Correlations & factors", "Tail risk", "Robustness"])
     # Each fund aligned with the benchmarks over the window (own history)
     win = slice(start_m.to_timestamp(), end_m.to_timestamp(how="end"))
     bench = pd.concat({"CDI": cdi, "IMA-B": imab, "Ibovespa": ibov,
@@ -905,6 +905,7 @@ def main():
 
     # --- Sharpe tests -------------------------------------------------------
     with tabs[1]:
+        st.subheader("Sharpe ratio tests")
         rows = []
         base_ex = (P["Baseline"] - rf).values
         for k in P.columns[1:]:
@@ -925,7 +926,9 @@ def main():
                                      "SE (ann.)": "{:.3f}", "p-value": "{:.3f}"}))
 
     # --- Optimal size -------------------------------------------------------
-    with tabs[2]:
+    with tabs[1]:
+        st.divider()
+        st.subheader("Optimal sleeve size")
         grid = np.linspace(0, 1, 101)
         curves, rows = {}, []
         for name, fr in series.items():
@@ -962,7 +965,7 @@ def main():
                        "Bootstrap: 500 stationary block resamples (6-month blocks).")
 
     # --- Horizon -------------------------------------------------------------
-    with tabs[3]:
+    with tabs[2]:
         z = norm.ppf(conf / 100)
         rows, probs = [], {}
         yrs = np.round(np.arange(0.5, 10.01, 0.25), 2)
@@ -1003,7 +1006,8 @@ def main():
                      "return → lower SR → longer horizon.\n\nAssumes iid normal "
                      "returns and takes the historical Sharpe as the true one, so "
                      "it understates the horizon for short track records.")
-            line_chart(pd.DataFrame(probs), "%", "Years held", y_fmt=",.0f")
+            line_chart(pd.DataFrame(probs), "%", "Years held", y_fmt=",.0f",
+                       label_fmt=",.0f")
             fmt_h = lambda v: "never" if not np.isfinite(v) else f"{v:,.1f}"
             st.dataframe(H.style.format({
                 "Sharpe vs CDI (log)": "{:.2f}", "Ann. vol": "{:.1%}",
@@ -1012,7 +1016,8 @@ def main():
                 f"Years to beat baseline ({conf}%)": fmt_h}))
 
     # --- Correlations ---------------------------------------------------------
-    with tabs[4]:
+    with tabs[3]:
+        st.subheader("Correlations")
         C = pd.concat([fr_all[list(c for c in fr_all.columns)],
                        bench[["IMA-B", "Ibovespa", "World"]],
                        fx.reindex(bench.index).rename("USD/BRL"),
@@ -1042,7 +1047,7 @@ def main():
                    "not meaningful.")
 
     # --- Tail risk ------------------------------------------------------------
-    with tabs[5]:
+    with tabs[4]:
         tseries = dict(series)
         tseries.update({"IMA-B": bench["IMA-B"], "Ibovespa": bench["Ibovespa"],
                         "World": bench["World"], "Baseline": base_full,
@@ -1085,7 +1090,9 @@ def main():
                    "average return in the worst 5% of months.")
 
     # --- Factor regression ----------------------------------------------------
-    with tabs[6]:
+    with tabs[3]:
+        st.divider()
+        st.subheader("Factor regression")
         fac = pd.concat([bench["CDI"], bench["IMA-B"], bench["Ibovespa"],
                          bench["World"], fx.reindex(bench.index).rename("USD/BRL")],
                         axis=1)
@@ -1147,7 +1154,7 @@ def main():
             st.altair_chart(bars.properties(height=320), width="stretch")
 
     # --- Robustness -----------------------------------------------------------
-    with tabs[7]:
+    with tabs[5]:
         cuts = [("2010-01", "2014-12"), ("2015-01", "2019-12"),
                 ("2020-01", "2022-12"), ("2023-01", "2099-12")]
         sub = []
