@@ -590,6 +590,15 @@ def portfolio(rets, w):
 NUM_FMT = ",.2f"  # #,##0.00
 
 
+def _int_ticks(idx, max_ticks=11):
+    """Whole-number tick positions (0, 1, 2… or 0, 10, 20…) for a numeric axis."""
+    lo, hi = int(np.floor(min(idx))), int(np.ceil(max(idx)))
+    lo = min(lo, 0)
+    step = next(s for s in (1, 2, 5, 10, 20, 25, 50, 100, 250, 500, 1000)
+                if (hi - lo) / s <= max_ticks - 1)
+    return list(range(lo - lo % step, hi + 1, step))
+
+
 def line_chart(data, y_title="", x_title=None, height=380, y_fmt=NUM_FMT,
                x_fmt=",.0f", label_fmt=NUM_FMT):
     """Altair line chart: #,##0.00 axis labels and a bold end-of-line label
@@ -605,7 +614,7 @@ def line_chart(data, y_title="", x_title=None, height=380, y_fmt=NUM_FMT,
     x = alt.X(f"{xname}:{'T' if temporal else 'Q'}",
               title=None if temporal else x_title,
               axis=alt.Axis(format="%Y", tickCount="year") if temporal
-              else alt.Axis(format=x_fmt))
+              else alt.Axis(format=x_fmt, values=_int_ticks(df.index)))
     y = alt.Y("Value:Q", title=y_title, axis=alt.Axis(format=y_fmt),
               scale=alt.Scale(zero=False))
     color = alt.Color("Series:N", legend=alt.Legend(orient="bottom", title=None))
