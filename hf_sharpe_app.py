@@ -836,7 +836,7 @@ def main():
     ex = R.sub(rf, axis=0).drop(columns="CDI")
     risky = ["IMA-B", "Ibovespa", "World"]
 
-    tabs = st.tabs(["Performance", "Summary", "Sharpe tests", "Optimal size",
+    tabs = st.tabs(["Summary", "Sharpe tests", "Optimal size",
                     "Horizon", "Correlations", "Tail risk",
                     "Factor regression", "Robustness"])
     # Each fund aligned with the benchmarks over the window (own history)
@@ -851,14 +851,17 @@ def main():
     fmt = {"Ann. return": "{:.2%}", "Ann. vol": "{:.2%}", "Sharpe": "{:.2f}",
            "Sortino": "{:.2f}", "Max DD": "{:.1%}", "Months": "{:.0f}"}
 
-    # --- Performance ----------------------------------------------------------
+    # --- Summary ------------------------------------------------------------
     with tabs[0]:
+        stats = pd.DataFrame({k: ann_stats(P[k], rf) for k in P}).T
+        assets = pd.DataFrame({k: ann_stats(R[k], rf)
+                               for k in ["CDI", "IMA-B", "Ibovespa", "World", "HF"]}).T
+        best = stats["Sharpe"].idxmax()
+
         fr = fund_rets.loc[start_m.to_timestamp():end_m.to_timestamp(how="end")]
-        firsts = fr.apply(lambda c: c.first_valid_index())
-        firsts = firsts.dropna()
-        if firsts.empty:
-            st.warning("No fund returns in the selected window.")
-        else:
+        firsts = fr.apply(lambda c: c.first_valid_index()).dropna()
+        perf_msg, lv = "", None
+        if not firsts.empty:
             # Start where every fund has data (or the chosen start, if later)
             t0 = firsts.max()
             fr = fr.loc[t0:].dropna(axis=1, how="all")
@@ -873,40 +876,35 @@ def main():
                 lv.loc[lv.index > t, c] = np.nan
             n_m = pd.concat([fr.notna().sum(), pd.Series(len(fr), index=ref.columns)])
             cagr = (lv.ffill().iloc[-1] / 100) ** (12 / n_m) - 1
-            fund_cagr = cagr[fr.columns].sort_values()
-            st.info(
-                f"Since **{base_row.index[0]:%b %Y}** ({len(fr)} months, the "
-                f"first month all selected funds have data), the best fund "
-                f"compounded **{_pct(fund_cagr.iloc[-1])}/yr** "
-                f"(*{fund_cagr.index[-1]}*) and the worst {_pct(fund_cagr.iloc[0])}/yr "
-                f"(*{fund_cagr.index[0]}*), vs CDI {_pct(cagr['CDI'])}/yr and "
-                f"Ibovespa {_pct(cagr['Ibovespa'])}/yr.")
+            fc = cagr[fr.columns].sort_values()
+            perf_msg = (
+                f"Since {base_row.index[0]:%b %Y}, the best fund compounded "
+                f"**{_pct(fc.iloc[-1])}/yr** (*{fc.index[-1]}*)"
+                + (f" and the worst {_pct(fc.iloc[0])}/yr (*{fc.index[0]}*)"
+                   if len(fc) > 1 else "")
+                + f", vs CDI {_pct(cagr['CDI'])}/yr and Ibovespa "
+                f"{_pct(cagr['Ibovespa'])}/yr. ")
+        st.info(
+            perf_msg
+            + f"Baseline Sharpe is **{stats.loc['Baseline','Sharpe']:.2f}**; with "
+            f"{last} it is **{stats.loc[last,'Sharpe']:.2f}** (best mix: *{best}*), "
+            f"and max drawdown goes from {_pct(stats.loc['Baseline','Max DD'])} to "
+            f"{_pct(stats.loc[last,'Max DD'])}.")
+
+        if lv is not None:
             st.subheader("Cumulative return (rebased to 100)")
             line_chart(lv, "Index (start = 100)", y_fmt=",.0f")
-
-    # --- Summary ------------------------------------------------------------
-    with tabs[1]:
-        stats = pd.DataFrame({k: ann_stats(P[k], rf) for k in P}).T
-        assets = pd.DataFrame({k: ann_stats(R[k], rf)
-                               for k in ["CDI", "IMA-B", "Ibovespa", "World", "HF"]}).T
-        best = stats["Sharpe"].idxmax()
-        st.info(
-            f"Baseline Sharpe is **{stats.loc['Baseline','Sharpe']:.2f}**; with "
-            f"the largest sleeve ({last}) it is **{stats.loc[last,'Sharpe']:.2f}**, "
-            f"and the best of all mixes is *{best}*. "
-            f"The HF sleeve alone returned {_pct(assets.loc['HF','Ann. return'])}/yr "
-            f"vs CDI {_pct(assets.loc['CDI','Ann. return'])}, with max drawdown "
-            f"{_pct(assets.loc['HF','Max DD'])} (baseline: "
-            f"{_pct(stats.loc['Baseline','Max DD'])}).")
+        else:
+            st.warning("No fund returns in the selected window.")
+        st.subheader("Cumulative excess return over CDI (start = 100)")
+        line_chart((1 + P.sub(rf, axis=0)).cumprod() * 100, "Index", y_fmt=",.0f")
         st.subheader("Portfolios")
         st.dataframe(stats.style.format(fmt))
         st.subheader("Building blocks")
         st.dataframe(assets.style.format(fmt))
-        st.subheader("Cumulative excess return over CDI (start = 100)")
-        line_chart((1 + P.sub(rf, axis=0)).cumprod() * 100, "Index", y_fmt=",.0f")
 
     # --- Sharpe tests -------------------------------------------------------
-    with tabs[2]:
+    with tabs[1]:
         rows = []
         base_ex = (P["Baseline"] - rf).values
         for k in P.columns[1:]:
@@ -927,7 +925,7 @@ def main():
                                      "SE (ann.)": "{:.3f}", "p-value": "{:.3f}"}))
 
     # --- Optimal size -------------------------------------------------------
-    with tabs[3]:
+    with tabs[2]:
         grid = np.linspace(0, 1, 101)
         curves, rows = {}, []
         for name, fr in series.items():
@@ -952,19 +950,19 @@ def main():
                 f"The bootstrap range ({O.loc[top,'Bootstrap 10%']:.0%}–"
                 f"{O.loc[top,'Bootstrap 90%']:.0%}) shows how uncertain that optimum "
                 f"is; treat a wide range as a weak signal and size toward the low end.")
+            st.subheader("Portfolio Sharpe by sleeve size")
+            line_chart(pd.DataFrame(curves), "Sharpe (ann.)", "Sleeve (%)")
             st.dataframe(O.style.format({
                 "Optimal sleeve": "{:.0%}", "Bootstrap 10%": "{:.0%}",
                 "Bootstrap median": "{:.0%}", "Bootstrap 90%": "{:.0%}",
                 "Sharpe baseline": "{:.2f}", "Sharpe at optimum": "{:.2f}",
                 "Months": "{:.0f}"}))
-            st.subheader("Portfolio Sharpe by sleeve size")
-            line_chart(pd.DataFrame(curves), "Sharpe (ann.)", "Sleeve (%)")
             st.caption("The fund replaces the baseline pro rata (monthly "
                        "rebalancing), over each fund's own history in the window. "
                        "Bootstrap: 500 stationary block resamples (6-month blocks).")
 
     # --- Horizon -------------------------------------------------------------
-    with tabs[4]:
+    with tabs[3]:
         z = norm.ppf(conf / 100)
         rows, probs = [], {}
         yrs = np.round(np.arange(0.5, 10.01, 0.25), 2)
@@ -994,25 +992,27 @@ def main():
                  f"no horizon reaches {conf}% confidence.")
                 + " Funds needing longer than you'd realistically hold them are "
                   "a bet you can't expect to see pay off.")
+            st.subheader(
+                "Probability of beating CDI by holding period (%)",
+                help="**How it's computed**\n\n"
+                     "P(fund beats CDI over T years) = Φ(SR · √T), so the horizon "
+                     f"for {conf}% confidence is **T = (z / SR)²**, with z = "
+                     f"{z:.2f} and SR the annualised Sharpe of excess log returns "
+                     "vs CDI (vs the baseline for the last column, using the "
+                     "information ratio).\n\nHigher volatility at the same excess "
+                     "return → lower SR → longer horizon.\n\nAssumes iid normal "
+                     "returns and takes the historical Sharpe as the true one, so "
+                     "it understates the horizon for short track records.")
+            line_chart(pd.DataFrame(probs), "%", "Years held", y_fmt=",.0f")
             fmt_h = lambda v: "never" if not np.isfinite(v) else f"{v:,.1f}"
             st.dataframe(H.style.format({
                 "Sharpe vs CDI (log)": "{:.2f}", "Ann. vol": "{:.1%}",
                 "Info ratio vs baseline": "{:.2f}",
                 f"Years to beat CDI ({conf}%)": fmt_h,
                 f"Years to beat baseline ({conf}%)": fmt_h}))
-            st.markdown(
-                r"Horizon $T = \left(\dfrac{z_c}{SR}\right)^2$, from "
-                r"$P(\text{fund} > \text{CDI over } T) = \Phi(SR\sqrt{T})$ with "
-                r"$SR = \mu/\sigma$ of annual excess log returns. Higher vol at the "
-                r"same excess return ⇒ lower SR ⇒ longer horizon.")
-            st.caption("Assumes iid normal returns and treats the historical "
-                       "Sharpe as the true one, so it understates the horizon "
-                       "when the Sharpe is estimated from a short history.")
-            st.subheader("Probability of beating CDI by holding period (%)")
-            line_chart(pd.DataFrame(probs), "%", "Years held", y_fmt=",.0f")
 
     # --- Correlations ---------------------------------------------------------
-    with tabs[5]:
+    with tabs[4]:
         C = pd.concat([fr_all[list(c for c in fr_all.columns)],
                        bench[["IMA-B", "Ibovespa", "World"]],
                        fx.reindex(bench.index).rename("USD/BRL"),
@@ -1042,7 +1042,7 @@ def main():
                    "not meaningful.")
 
     # --- Tail risk ------------------------------------------------------------
-    with tabs[6]:
+    with tabs[5]:
         tseries = dict(series)
         tseries.update({"IMA-B": bench["IMA-B"], "Ibovespa": bench["Ibovespa"],
                         "World": bench["World"], "Baseline": base_full,
@@ -1061,13 +1061,6 @@ def main():
                    "smooth gains with occasional sharp losses, which Sharpe understates."
                    if neg else "No fund shows strongly negative skew, so Sharpe "
                    "isn't hiding obvious crash risk."))
-        st.dataframe(TR.style.format({
-            "Skewness": "{:.2f}", "Excess kurtosis": "{:.2f}",
-            "Worst month": "{:.2%}", "CVaR 5% (monthly)": "{:.2%}",
-            "% negative months": "{:.0%}", "Months": "{:.0f}"}), width="stretch")
-        st.caption("Skew < 0 and high kurtosis = fat left tail. CVaR 5% = "
-                   "average return in the worst 5% of months.")
-
         st.subheader("Return distributions vs a normal bell")
         st.caption("Bars: actual monthly returns. Solid line: their smoothed "
                    "shape (this is where skew and kurtosis show up). Dashed "
@@ -1083,8 +1076,16 @@ def main():
                 with col:
                     dist_chart(r, name)
 
+        st.subheader("Tail statistics")
+        st.dataframe(TR.style.format({
+            "Skewness": "{:.2f}", "Excess kurtosis": "{:.2f}",
+            "Worst month": "{:.2%}", "CVaR 5% (monthly)": "{:.2%}",
+            "% negative months": "{:.0%}", "Months": "{:.0f}"}), width="stretch")
+        st.caption("Skew < 0 and high kurtosis = fat left tail. CVaR 5% = "
+                   "average return in the worst 5% of months.")
+
     # --- Factor regression ----------------------------------------------------
-    with tabs[7]:
+    with tabs[6]:
         fac = pd.concat([bench["CDI"], bench["IMA-B"], bench["Ibovespa"],
                          bench["World"], fx.reindex(bench.index).rename("USD/BRL")],
                         axis=1)
@@ -1146,7 +1147,7 @@ def main():
             st.altair_chart(bars.properties(height=320), width="stretch")
 
     # --- Robustness -----------------------------------------------------------
-    with tabs[8]:
+    with tabs[7]:
         cuts = [("2010-01", "2014-12"), ("2015-01", "2019-12"),
                 ("2020-01", "2022-12"), ("2023-01", "2099-12")]
         sub = []
